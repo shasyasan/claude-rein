@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# rein's single dispatcher. Common options (--cwd / --root / --config) are received and
+# normalized here in one place, and resolved absolute paths are passed on to the subcommand.
+# There is exactly one real copy of this file (~/.local/bin/rein is a symlink to it). Since
+# it's started through that symlink, it resolves its own real path by following the link
+# first (without that it can't find the scripts bundled alongside it).
+set -uo pipefail
+
+# Normalizes two things about the execution environment right at the entry point.
+# The key point is placing this **before loading the shared library** -- bash parses
+# a script one command at a time as it goes, so everything after these two lines,
+# including the rest of this file, gets parsed and run under the normalized
+# environment (observed: with these two lines added, every verb works under eucJP --
+# both at this entry point and in what it loads).
+#   - Character set: bash's own parser works in **LC_CTYPE's character set**, so under
+#     a non-UTF-8 multibyte locale (ja_JP.eucJP, ja_JP.SJIS, zh_CN.GB18030,
+#     ko_KR.eucKR), the UTF-8 byte sequences in this implementation's non-ASCII text
+#     drag quotes and `}` characters along with them, and every script fails with
+#     nothing but a bash syntax error (a hook returns 2 on Stop, which becomes **a
+#     stop-block in itself**; the statusline can't write a single line of usage;
+#     doctor is the only one that returns exit 0 and reports every line as OK).
+#     What gets forced is **the character set alone** -- collation, time formatting,
+#     and messages are left exactly as the environment already has them (rewriting
+#     anything beyond what this bug touches would change behavior on UTF-8 machines
+#     too).
+#     `LC_ALL` overrides `LC_CTYPE`, so it's unset first (without that, setting
+#     `LC_CTYPE` has no effect -- observed). The value `UTF-8` is the
+#     **character-set-only locale** macOS always has (/usr/share/locale/UTF-8);
+#     unlike `C.UTF-8`, it's present even on old macOS releases.
+#   - `CDPATH`: wherever it is set, `cd <relative path>` **prints the destination to
+#     stdout**, so `$(cd ... && pwd -P)` comes back as two lines. A run that passed a
+#     relative path to `--cwd` failed with "the target directory's path contains a
+#     newline" -- a reason **unrelated to the actual input** (observed).
+# Starts zero external commands (doesn't add to a hook's fixed cost on the no-op path).
+# The same two lines also appear at the entry point of hooks/rein-hook-launcher.sh and
+# scripts/rein-*.sh (this is the canonical explanation).
+unset LC_ALL CDPATH
+export LC_CTYPE=UTF-8
+
+# Follow a symlink to get its real path. macOS readlink has no -f, so this rolls its
+# own. Splitting out the directory and the name is done with **shell string operations
+# only** (dirname / basename are never started). Using an external command's output
+# directly as a destination would mean that whenever that command returns empty or
+# `.` -- because something placed a same-named command earlier on PATH -- the
+# destination collapses to the caller's own cwd, and it would then load and run
+# `<parent of that cwd>/scripts/lib/rein-common.sh` (start it from a booby-trapped
+# directory, and the planted file runs with this process's privileges -- observed).
+# A path passed in relative form has **`$PWD` prefixed before it's followed** to make
+# it absolute (the same shape as scripts/rein-hook.sh). Without that prefix, a launch
+# with no path separator at all (`bash rein`) leaves `${path%/*}` unable to cut out a
+# directory.
+# Resolving the symlink itself needs no `cd`. The only `cd` left is for **normalizing
+# the real location** (init / doctor compare resolve_self's output by string equality
+# to check whether the symlink on PATH points at this implementation, so the value
+# must not vary by how it was launched) -- its destination is a variable cut out by
+# string operations, so it can never be empty (this never produces a `cd ""`).
+# The same shape appears in launcher_resolve in hooks/rein-hook-launcher.sh and in
+# scripts/rein-watcher.sh.
+resolve_self() {
+  local path="$1" target dir count=0
+  case "$path" in
+    /*) ;;
+    *) path="$PWD/$path" ;;
+  esac
+  while [ -L "$path" ]; do
+    count=$((count + 1))
+    if [ "$count" -gt 32 ]; then
+      return 1
+    fi
+    target="$(readlink "$path")" || return 1
+    case "$target" in
+      /*) path="$target" ;;
+      *) path="${path%/*}/$target" ;;
+    esac
+  done
+  # Only right under the filesystem root (`/rein`) does the cut produce an empty
+  # string; name the root explicitly instead of passing an empty value to `cd`.
+  dir="${path%/*}"
+  [ -n "$dir" ] || dir="/"
+  # Swallow cd's own stderr (for an unresolvable parent or a directory with no
+  # permission, bash's raw line `bin/rein: line N: cd: ...: Permission denied` would
+  # otherwise mix into user-facing output). The caller states the reason in its own
+  # one line. Read the result by **whether it's empty** -- a run that returned empty
+  # is never read as "resolved".
+  dir="$(cd "$dir" 2>/dev/null && pwd -P)"
+  [ -n "$dir" ] || return 1
+  printf '%s/%s\n' "$dir" "${path##*/}"
+}
+
+SCRIPT_NAME="rein"
+REIN_BIN_PATH="$(resolve_self "${BASH_SOURCE[0]}")"
+if [ -z "$REIN_BIN_PATH" ]; then
+  printf '%s: cannot resolve its own real path: %s\n' "$SCRIPT_NAME" "${BASH_SOURCE[0]}" >&2
+  exit 1
+fi
+# Cut out the root of the bundled scripts with **string operations only** (needs no
+# `cd`, no external command). REIN_BIN_PATH is an absolute path resolve_self already
+# normalized with `pwd -P`, so dropping the last two components is already the real
+# root -- there's no need to append `/..` and descend again (doing that would open one
+# more place where the destination is decided by an external command's output).
+# Check for a resolution failure here too. Without the check, REPO_ROOT would carry on
+# empty, and loading the bundled library would fail with
+# `/scripts/lib/rein-common.sh: No such file or directory` -- **a reason that looks
+# unrelated to this implementation** (the actual cause never reaches the person reading it).
+REPO_ROOT="${REIN_BIN_PATH%/*}"
+REPO_ROOT="${REPO_ROOT%/*}"
+if [ -z "$REPO_ROOT" ]; then
+  printf '%s: cannot resolve the location of the bundled scripts: %s\n' "$SCRIPT_NAME" "$REIN_BIN_PATH" >&2
+  exit 1
+fi
+SCRIPTS_DIR="$REPO_ROOT/scripts"
+# The location of the resident watcher is held by REIN_WATCHER_SCRIPT_PATH in the
+# shared library (both the side that starts it and the side that checks a PID against
+# it for reuse read the same single value).
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/rein-common.sh
+. "$SCRIPTS_DIR/lib/rein-common.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/rein-config.sh
+. "$SCRIPTS_DIR/lib/rein-config.sh"
+
+# The implementation of each verb lives under scripts/lib/cli/ (one verb, one file);
+# this file only holds the receiving end. Everything is loaded at startup because
+# which verb is being called isn't known until parsing the common options finishes
+# (lazy-loading per verb would make a loading failure surface in a different place
+# for each verb).
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/base.sh
+. "$SCRIPTS_DIR/lib/cli/base.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/config.sh
+. "$SCRIPTS_DIR/lib/cli/config.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/delegate.sh
+. "$SCRIPTS_DIR/lib/cli/delegate.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/up.sh
+. "$SCRIPTS_DIR/lib/cli/up.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/down.sh
+. "$SCRIPTS_DIR/lib/cli/down.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/status.sh
+. "$SCRIPTS_DIR/lib/cli/status.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/prune.sh
+. "$SCRIPTS_DIR/lib/cli/prune.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/doctor.sh
+. "$SCRIPTS_DIR/lib/cli/doctor.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/init.sh
+. "$SCRIPTS_DIR/lib/cli/init.sh"
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../scripts/lib/cli/snooze.sh
+. "$SCRIPTS_DIR/lib/cli/snooze.sh"
+
+TARGET_CWD=""
+ROOT_OPT=""
+CONFIG_FILE_OPT=""
+
+# Table mapping short forms (<scope>:<short form>:<long form>). **This table is
+# canonical** -- the usage listing, the ordering of verb case branches, and the
+# selftest all cross-check against it in both directions (adding a short form to the
+# implementation that's missing from the table, or adding it to the table and
+# forgetting the implementation, both fail). Scope is one of the common options
+# (common), an option shared by multiple verbs (verb), or a verb name, and the
+# selftest also checks that **no single letter carries two meanings within the same
+# scope**. Reuse across verbs (the same letter meaning something different for a
+# different verb) is allowed -- interpretation is scoped per verb, and both are that
+# verb's own convention.
+# Rationale for the assignments: -C matches git's -C (working directory); -F matches
+# ssh's -F (config file). -c isn't used for --config because -c is established in git
+# to mean **a config value**, not a config file (rein has a separate config set, so
+# mixing them up would pass a string meant as a value where a path is expected).
+# Lowercase -d is established to mean "detach from the foreground" (docker compose up
+# -d), so it's assigned to up's --detach, and an uppercase letter (-D) is used for the
+# runtime-directory option. -r also carries a recursive meaning, so the root uses -R.
+# **An irreversible deletion deletes nothing without `-f, --force`**, so the flags
+# that select what gets targeted (prune's -o / -s / -a) may have short forms -- a
+# single mistyped letter turning into a deletion is guarded not by withholding short
+# forms, but by keeping the actual execution behind one single gate.
+rein_cli_aliases() {
+  cat <<'EOF'
+common:-C:--cwd
+common:-R:--root
+common:-F:--config
+common:-V:--version
+common:-h:--help
+verb:-D:--runtime-dir
+up:-d:--detach
+up:-B:--no-bootstrap
+up:-H:--handoff
+up:-s:--settings
+status:-j:--json
+status:-a:--all
+prune:-f:--force
+prune:-o:--orphan
+prune:-s:--session
+prune:-a:--all
+init:-n:--dry-run
+config:-u:--user
+config:-p:--project
+EOF
+}
+
+# The description column starts at one fixed position within each section (this
+# doesn't require matching up across sections). Letting the column float per item
+# would break the vertical alignment starting from whichever item's text ran long
+# first. Column position is counted by display width, not character count -- a
+# full-width character mixed in would throw off just that line's alignment.
+# A verb's own options aren't listed on the verb's line -- they go in a separate
+# section instead -- because listing them there would push the description to the
+# next line for any verb whose signature reached the column, breaking the listing's
+# vertical alignment.
+# The description only states what changes how a command is typed or which one to
+# choose (not the name of the script it delegates to, a restatement obvious from
+# reading it, or background on the spec). An explanation that doesn't fit on one line belongs in the
+# README and docs/spec/ instead.
+usage() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME [global options] <command> [options] [args]
+  $SCRIPT_NAME help
+  $SCRIPT_NAME --version
+  $SCRIPT_NAME --selftest [section ...]
+  $SCRIPT_NAME --selftest --list
+
+Global options:
+  -C, --cwd <path>       set the target project directory
+  -R, --root <path>      set the root for this lineage's config, state, and runtime data
+  -F, --config <path>    set the user-scope config file
+  -V, --version          print the version
+  -h, --help             print this help
+
+Lineage:
+  up                          start the watcher, the primary session, and the seat
+  down                        stop the watcher and the primary session
+  snooze <duration>           postpone automatic handover for a given duration
+
+Session & handoff:
+  request [args]              request a handover
+  attach [args]               keep re-attaching to the current primary session
+
+Setup & config:
+  init                        install the required files and integrations
+  config get <key>            print the effective value of a setting
+  config set <key> <value>    write a setting value
+  config unset <key>          remove a setting and fall back to the default
+  config list                 list settings with their origin
+  config allow                allow this project's settings file to take effect
+  config deny                 keep this project's settings file from taking effect
+
+Inspect & maintenance:
+  status                      print the state of this lineage
+  doctor                      check dependencies and installation
+  prune                       list cleanup candidates (deletes only with --force)
+
+Command-specific options:
+  up
+    -D, --runtime-dir <path>               set where runtime data is kept
+    -d, --detach                           do not attach to the seat after starting
+    -B, --no-bootstrap                     start only the watcher (implies --detach)
+    -H, --handoff <path>                   set the handoff document for the first session
+    -s, --settings <value>                 set the settings passed to the session
+
+  down
+    -D, --runtime-dir <path>               set where runtime data is kept
+        --watcher-only                     stop only the watcher
+
+  snooze
+    -D, --runtime-dir <path>               set where runtime data is kept
+
+  request
+        --runtime-dir <path>               set where runtime data is kept
+        --session-id <id>                  set the requesting session's ID (required)
+        --handoff <path>                   set the handoff document to pass to the successor
+        --successor-name <name>            set the successor session's display name
+        --note <text>                      leave a note in the handover request
+
+  init
+    -D, --runtime-dir <path>               set where runtime data is kept
+    -n, --dry-run                          only print what would be installed
+
+  config <set|unset>
+    -p, --project                          write to the project settings (default)
+    -u, --user                             write to the user settings
+
+  status
+    -D, --runtime-dir <path>               set where runtime data is kept
+    -j, --json                             print in JSON format
+    -a, --all                              print every lineage
+
+  doctor
+    -D, --runtime-dir <path>               set where runtime data is kept
+
+  prune
+    -D, --runtime-dir <path>               set where runtime data is kept
+    -f, --force                            actually delete the candidates
+    -o, --orphan                           also target orphaned runtime directories
+    -s, --session                          also target sessions of finished generations
+    -a, --all                              target every kind
+EOF
+}
+
+fail() {
+  printf '%s: %s\n' "$SCRIPT_NAME" "$1" >&2
+  return 1
+}
+
+warn() {
+  printf '%s: warning: %s\n' "$SCRIPT_NAME" "$1" >&2
+}
+
+fail_usage() {
+  printf '%s: %s\n' "$SCRIPT_NAME" "$1" >&2
+  usage >&2
+  return 2
+}
+
+abs_path() {
+  local path="$1"
+  case "$path" in
+    /*) ;;
+    *) path="$PWD/$path" ;;
+  esac
+  printf '%s\n' "$path"
+}
+
+# Resolve the common options down to their actual destinations.
+# --root replaces rein's own per-lineage environment variables, not XDG. Replacing XDG
+# instead would mean (1) REIN_CONFIG_FILE and REIN_RUNTIME_DIR already present in the
+# environment would win, so isolation wouldn't hold, and (2) the replaced XDG would
+# propagate to the delegated claude process too, moving state that has nothing to do
+# with what's being checked.
+# This never creates the directory here (so a read-only command never produces one).
+# Actual creation is left to the write paths (config set / unset, the delegated
+# process's own state writes).
+normalize_common() {
+  local root key config_file resolved_cwd cwd_error
+  if [ -z "$TARGET_CWD" ]; then
+    TARGET_CWD="$PWD"
+  fi
+  if [ ! -d "$TARGET_CWD" ]; then
+    fail "the target directory doesn't exist: ${TARGET_CWD}"
+    return 2
+  fi
+  # Capture the result of resolution in a **temporary variable**. With the shape
+  # `TARGET_CWD="$(...)" || { ... }`, the assignment already completes as soon as the
+  # command substitution returns empty, so `$TARGET_CWD` as read on the `||` side is
+  # empty -- the one line of reason ends up not naming a path. It also doesn't swallow
+  # cd's own stderr, so bash's raw line (`bin/rein: line N: cd: ...: Permission
+  # denied`) mixes into user-facing output. A directory that exists but can't be
+  # resolved (an unreadable parent, no permission to traverse it) does actually
+  # happen, so both are closed off.
+  resolved_cwd="$(cd "$TARGET_CWD" 2>/dev/null && pwd -P)"
+  if [ -z "$resolved_cwd" ]; then
+    # **Expected to fail here** (this is only fetching the text of the reason), so
+    # the exit code isn't checked.
+    cwd_error="$(cd "$TARGET_CWD" 2>&1 || :)"
+    # Drop bash's own prefix (`<script>: line <n>: cd: `) and keep only the reason.
+    case "$cwd_error" in
+      *": cd: "*) cwd_error="${cwd_error##*": cd: "}" ;;
+    esac
+    fail "cannot resolve the target directory: ${cwd_error:-$TARGET_CWD}"
+    return 2
+  fi
+  TARGET_CWD="$resolved_cwd"
+  if [ -n "$ROOT_OPT" ]; then
+    root="$(abs_path "$ROOT_OPT")"
+    key="$(rein_cwd_key "$TARGET_CWD")" || {
+      fail "cannot resolve the runtime directory for --root: ${TARGET_CWD}"
+      return 1
+    }
+    # Build the layout under the root from the shared library's constants (the hook
+    # side works this layout out in reverse to check the records location is
+    # consistent, and a decision hint names `--root` by working it out in reverse too
+    # -- don't keep the literal in two places).
+    REIN_CONFIG_FILE="$root/$REIN_ROOT_CONFIG_RELPATH"
+    REIN_RUNTIME_DIR="$root/$REIN_ROOT_STATE_RELDIR/$key"
+    # Move the lineage's own records under the root as well (if two runs from the
+    # same cwd shared `<cwd>/.rein/`, they'd overwrite each other's current pointer
+    # and neither lineage could be told apart afterward). The key is left out because
+    # this environment variable is **the records root** (the parent of each lineage's
+    # own location) -- a cross-lineage scan (status --all, prune) looks up each key
+    # under this same root.
+    REIN_RECORDS_ROOT="$root/$REIN_ROOT_RECORDS_RELDIR"
+    export REIN_CONFIG_FILE REIN_RUNTIME_DIR REIN_RECORDS_ROOT
+  fi
+  if [ -n "$CONFIG_FILE_OPT" ]; then
+    config_file="$(abs_path "$CONFIG_FILE_OPT")"
+    REIN_CONFIG_FILE="$config_file"
+    export REIN_CONFIG_FILE
+  fi
+  return 0
+}
+
+cmd_version() {
+  local manifest="$REPO_ROOT/$REIN_PLUGIN_MANIFEST_RELPATH" version
+  if ! command -v jq >/dev/null 2>&1; then
+    fail "jq is missing (cannot read the canonical version at ${manifest})"
+    return 1
+  fi
+  if [ ! -f "$manifest" ]; then
+    fail "the canonical version file doesn't exist: ${manifest}"
+    return 1
+  fi
+  version="$(jq -r '.version // empty' "$manifest" 2>/dev/null)"
+  if [ -z "$version" ]; then
+    fail "the canonical version file has no version field: ${manifest}"
+    return 1
+  fi
+  printf 'rein %s\n' "$version"
+  printf 'contract-schema %s %s %s\n' \
+    "$REIN_MARKER_SCHEMA" "$REIN_POINTER_SCHEMA" "$REIN_LOG_SCHEMA"
+  printf 'path %s\n' "$REIN_BIN_PATH"
+  return 0
+}
+
+run_subcommand() {
+  local sub="$1"
+  shift
+  case "$sub" in
+    config)
+      cmd_config "$@"
+      return $?
+      ;;
+    request)
+      delegate "$SCRIPTS_DIR/rein-request.sh" --cwd "$TARGET_CWD" "$@"
+      return $?
+      ;;
+    attach)
+      delegate "$SCRIPTS_DIR/rein-seat.sh" --cwd "$TARGET_CWD" "$@"
+      return $?
+      ;;
+    bootstrap)
+      delegate "$REIN_WATCHER_SCRIPT_PATH" --cwd "$TARGET_CWD" --bootstrap "$@"
+      return $?
+      ;;
+    up)
+      cmd_up "$@"
+      return $?
+      ;;
+    down)
+      cmd_down "$@"
+      return $?
+      ;;
+    status)
+      cmd_status "$@"
+      return $?
+      ;;
+    snooze)
+      cmd_snooze "$@"
+      return $?
+      ;;
+    prune)
+      cmd_prune "$@"
+      return $?
+      ;;
+    doctor)
+      cmd_doctor "$@"
+      return $?
+      ;;
+    init)
+      cmd_init "$@"
+      return $?
+      ;;
+    help)
+      # No per-verb help exists, so a following argument is failed with a reason
+      # rather than silently discarded.
+      if [ $# -gt 0 ]; then
+        fail_usage "help takes no arguments: $1"
+        return 2
+      fi
+      usage
+      return 0
+      ;;
+  esac
+  fail_usage "unknown subcommand: ${sub}"
+  return 2
+}
+
+# For a common option that takes a value, fail with a reason both a run that ends with
+# no value at all and one that passes an **explicit empty value**. Not silently
+# treating an empty value as unset follows the same discipline as the verb-level
+# options (rein_config_check_opt) -- a run where `CFG` in
+# `rein --config "$CFG" config list` came out empty would carry on into `up` reading
+# the default `~/.config/rein/config` instead of the intended config (and
+# `--cwd ""` would shut down the shell's own current lineage instead of the intended
+# target). Don't let it run on a lower layer's value without ever signaling that
+# something was wrong.
+need_value() {
+  local flag="$1" count="$2" value="${3-}"
+  if [ "$count" -lt 2 ]; then
+    fail_usage "${flag} requires a value"
+    return 2
+  fi
+  if [ -z "$value" ]; then
+    fail_usage "${flag} cannot take an empty value (not treated as unspecified)"
+    return 2
+  fi
+  return 0
+}
+
+main() {
+  local sub=""
+  case "${1:-}" in
+    --selftest)
+      # Only loaded here. It's a larger amount of code than any verb's own
+      # implementation, so loading it on every ordinary launch would tax even the
+      # paths that run on every tool call (the ones hooks call into).
+      shift
+      # shellcheck source-path=SCRIPTDIR
+      # shellcheck source=../scripts/lib/cli/selftest/selftest.sh
+      . "$SCRIPTS_DIR/lib/cli/selftest/selftest.sh"
+      selftest "$@" # test-side-scope-exempt: the one line that starts the selftest entry point (not a production writer)
+      return $?
+      ;;
+  esac
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd | -C)
+        need_value "--cwd" $# "${2-}" || return 2
+        TARGET_CWD="$2"
+        shift 2
+        ;;
+      --root | -R)
+        need_value "--root" $# "${2-}" || return 2
+        ROOT_OPT="$2"
+        shift 2
+        ;;
+      --config | -F)
+        need_value "--config" $# "${2-}" || return 2
+        CONFIG_FILE_OPT="$2"
+        shift 2
+        ;;
+      --version | -V)
+        cmd_version
+        return $?
+        ;;
+      --help | -h)
+        usage
+        return 0
+        ;;
+      --*)
+        fail_usage "unknown option: $1"
+        return 2
+        ;;
+      # Since this layer has short forms, an unknown single-letter flag is also
+      # failed **as an option** (falling through to `*)` would read `-x` as a
+      # subcommand name and return a different reason, "unknown subcommand").
+      -?*)
+        fail_usage "unknown option: $1"
+        return 2
+        ;;
+      *)
+        sub="$1"
+        shift
+        break
+        ;;
+    esac
+  done
+
+  if [ -z "$sub" ]; then
+    fail_usage "a subcommand is required"
+    return 2
+  fi
+  # help is just the entry point that prints usage, so it skips location resolution
+  # (normalize_common) -- to give it the same treatment as `--help` (usage prints even
+  # when the path given points at a directory that doesn't exist).
+  if [ "$sub" != "help" ]; then
+    normalize_common || return $?
+  fi
+  run_subcommand "$sub" "$@"
+}
+
+main "$@"

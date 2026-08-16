@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "claude-rein",
+  "description": "The distribution point for rein (a lifecycle module for Claude Code sessions). Distributes this repository itself as a single plugin.",
+  "owner": {
+    "name": "shasyasan"
+  },
+  "plugins": [
+    {
+      "name": "rein",
+      "source": "./"
+    }
+  ]
+}

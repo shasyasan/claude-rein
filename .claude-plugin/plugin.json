@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "rein",
+  "version": "1.0.0",
+  "description": "Automates a Claude Code session's lifecycle from outside the session (the handover contract, the watcher, the attach loop). Carries no semantics specific to any one project.",
+  "author": {
+    "name": "shasyasan"
+  },
+  "license": "MIT"
+}
