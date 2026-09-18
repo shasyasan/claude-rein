@@ -112,6 +112,7 @@ st_config_default_list() {
     'usage_stale_sec=1800' \
     'snooze_max_sec=3600' \
     'archive_days=30' \
+    'lineage_idle_sec=600' \
     'model=' \
     'settings=' \
     'runtime_dir=' \
@@ -211,10 +212,10 @@ EOF
   # would give a pin that breaks in 2 places when a key is added, and one of them ends up
   # unfixed. Every check after this one cross-checks against key_count instead.
   key_count="$(rein_config_keys | wc -l | tr -d ' ')"
-  if [ "$key_count" = "26" ]; then
+  if [ "$key_count" = "27" ]; then
     st_ok
   else
-    st_fail "pin the known-key count" "count isn't 26: ${key_count}"
+    st_fail "pin the known-key count" "count isn't 27: ${key_count}"
   fi
   # The known-keys table is expanded exactly once, at source time. Structurally confirms a
   # function that reruns the heredoc on every lookup hasn't come back (a performance

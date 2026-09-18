@@ -151,6 +151,29 @@ The wait resolves 3 ways.
 
 ## Current pointer `current.json`
 
+## Reporting a lineage nobody is running
+
+**The stretch between one session ending and the next one starting is the one thing the watch loop never looked at.** A handover that never completed, a session stopped by hand, a successor whose launch went nowhere: the pointer goes on naming a session that no longer exists, the watcher goes on polling for a marker that will never arrive, and the lineage sits still with nobody in the seat. Measured once at about 7 hours of an unattended run with nothing running at all, and not one line was written about it anywhere.
+
+The resident watch loop closes that gap. Once `lineage_idle_sec` has passed since a live session was last seen, it enumerates sessions and checks whether the one the current pointer names is alive. If it is not, one `lineage_idle` line goes to the handover log and the watcher log, and one notification goes out.
+
+| Condition | Check |
+| --- | --- |
+| The gap watch is on | `lineage_idle_sec` is a positive integer (`0` turns it off) |
+| A probe is due | `lineage_idle_sec` has passed since the last probe (both clocks are seeded when monitoring starts, so the stretch before this watcher existed is never counted) |
+| No handover is already in flight | No handover request marker is sitting in the runtime directory |
+| There is a session that should be running | The current pointer exists and passes contract validation |
+| That session is not alive | The same liveness judgment the handover's own waits use (`pid` present, and `status` / `state` not `done` / `failed` / `stopped`) |
+| The gap has outlasted the threshold | `lineage_idle_sec` has passed since a live session was last seen |
+| This dark spell has not been reported yet | The report is released again only after a live session has been seen |
+
+- **The probe is deliberately rare.** Enumerating sessions starts an external command and the loop polls every few seconds, so probing per cycle would mean one `claude` per cycle for as long as the watcher lives. Waiting for the threshold before the first probe -- which is also the earliest moment a report could be due -- costs a healthy lineage one enumeration per `lineage_idle_sec`, and nothing at all before the first one falls due.
+- **Undecidable is never read as a gap.** Enumeration that cannot be read (the CLI missing, stalling, or answering with something that is not JSON) leaves the clock where it was. It is not evidence that the seat is empty, and reporting off it would cry wolf on every hiccup. A lineage with no valid pointer is not a gap either -- nothing there names a session that should be running.
+- **Reported once per dark spell.** Repeating it every cycle would turn a single gap into an unbounded run of identical lines and notifications, and the notification channel would stop meaning anything.
+- **Reporting a gap never stops the watch.** The successor may still be started by hand, and a watcher that stepped down here would take the lineage's automation with it. The one thing that does end the round is failing to write the report, which is a stage failure like any other (see "Never discarding a failure's reason").
+- **The `--once` scan does not run this.** `--once` reports whether one request went through; watching for a gap is what residency is for.
+- The notification's message and the handover log's `detail` are **the same string**, as with every other reported event -- two wordings for one reason leave nobody able to say which to trust while tracing an incident.
+
 The pointer is **one file naming that lineage's current primary session** -- it's where the seat's attach target and R10's comparison target both come from.
 
 ```json
@@ -248,6 +271,7 @@ The handover log is **JSON Lines, one event per line** -- append-only, never tru
 | `successor_stopped` | A successor launched for a handover that didn't go through was retired with `claude stop` (`generation` is `null`) |
 | `failed` | Some stage failed or timed out (`detail` carries the stage and the reason) |
 
+| `lineage_idle` | Nobody is running this lineage: the session the current pointer names is not alive, and the gap has outlasted `lineage_idle_sec` (`detail` carries the session ID, how long the gap has run, and the threshold) |
 - **A rejection is recorded only as `marker_rejected`** (never also as a `failed` for the same reason). Rejection has its own independent vocabulary in the event set, and double-logging it would make it impossible for an audit log to tell "one input error" apart from "one mechanism malfunction." `failed` is used only for a stage failure.
 - **A cancellation's `generation` is `null`, with the generation it was accepted as kept in `detail`** -- since the pointer never advances, the next successful handover reuses that same number. Putting the number itself in the top-level field would let an audit confuse 2 separate handovers, but which acceptance disappeared can still be traced.
 - **A cancellation is never the same event as a rejection** -- a rejection is a defect in the request itself (fixable), while a cancellation is the user deliberately stopping it (nothing to fix); the next step differs between them. Their archive destinations differ too (see [the locations and locks specification](runtime.md)).
@@ -326,6 +350,7 @@ The handover log is **JSON Lines, one event per line** -- append-only, never tru
 | Threshold | 0 to 100 |
 | `--max-attach` (outside the settings layer -- the attach loop checks this one itself) | Non-negative integer |
 
+| Gap watch (`lineage_idle_sec`) | Non-negative integer (`0` turns the check off, the same way `final_output_timeout_sec` set to `0` turns the final-output wait off) |
 - **`0` never means "no cooldown" or "the escape hatch is disabled"** -- these 3 values only accept positive integers, and `0` is rejected on the type side (settings never carries a value that silently disables a feature).
 - Without this check, `sleep abc` would just return non-zero in 0.004 seconds -- silently collapsing into **a loop that never waits** (pegging the CPU while hammering enumeration). Likewise, an invalid wait cap would silently collapse to `deadline=0`, i.e. waiting forever.
 

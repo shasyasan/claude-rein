@@ -446,7 +446,15 @@ ST_DAEMON_GUARD_SEC=180
 # The argument is an upper limit, not a wait time -- sections whose observation is done close it
 # themselves via st_alarm_watcher_daemon.
 st_run_watcher_daemon_bg() {
-  local seconds="$1" st_daemon_child
+  local seconds="$1" st_daemon_child st_idle
+  # The gap watch's threshold. An **empty** env value is rejected by the settings layer rather
+  # than falling through to the default, so a case that does not set it gets the table's own
+  # default handed to it -- never a number written out here, which would quietly stop tracking
+  # the default the moment it changed.
+  st_idle="${ST_LINEAGE_IDLE:-}"
+  if [ -z "$st_idle" ] && rein_config_lookup lineage_idle_sec; then
+    st_idle="$REIN_CFG_KEY_DEFAULT"
+  fi
   ST_DAEMON_OUT="$ST_CWD/daemon.out"
   ST_DAEMON_RC_FILE="$ST_CWD/daemon.rc"
   # Capture the watcher's own pid so the cutoff can be sent from outside. The subshell's pid can't
@@ -467,6 +475,8 @@ st_run_watcher_daemon_bg() {
       REIN_LAUNCH_TIMEOUT_SEC=2 \
       REIN_EXIT_GRACE_SEC=1 \
       REIN_STOP_TIMEOUT_SEC=1 \
+      REIN_LINEAGE_IDLE_SEC="$st_idle" \
+      FAKE_AGENTS_FAIL="${ST_AGENTS_FAIL:-0}" \
       FAKE_PRED_ID="pred-1" \
       FAKE_SUCC_ID="succ-1" \
       perl -e 'alarm shift; exec @ARGV' "$seconds" \
@@ -590,6 +600,36 @@ st_lock_dump() {
     out="${out}${out:+ }${name}=$(rein_lock_field "$lock" "$name")"
   done
   printf '%s\n' "$out"
+}
+
+# Wait until at least one notification has been recorded. A reported event writes its log line
+# **before** it notifies, so a case that waited only for the log and then read the notification
+# log would be reading it in the gap between the two -- green or red depending on the machine.
+st_wait_for_notify() {
+  local limit="${1:-100}" i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ "$(rein_st_calls_total "$ST_NOTIFY")" -gt 0 ] && return 0
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Wait until the fake CLI has been asked to enumerate sessions at least `want` times. The gap
+# watch only ever speaks after it has probed, so a case claiming "and it said nothing" has to
+# witness a probe first -- reading the log without that would pass on any run where the probe
+# simply had not come around yet, and would go on passing with the probe removed entirely.
+# **Counted from the argv log, not the fake's own tally** -- the tally is written after the
+# failure branch, so a case that makes enumeration fail would wait forever on a counter that is
+# never going to move, and the one case most in need of this wait is exactly that one.
+st_wait_for_agents_calls() {
+  local want="$1" limit="${2:-150}" i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ "$(rein_st_count_sub "$ST_LOG" agents)" -ge "$want" ] && return 0
+    sleep 0.2
+    i=$((i + 1))
+  done
+  return 1
 }
 
 # Wait until the given line appears in the watcher log (returns 1 if it never does).

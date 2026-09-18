@@ -147,6 +147,7 @@ notice_cooldown_sec|NOTICE_COOLDOWN_SEC|pos-int|0|1800|positive integer, seconds
 usage_stale_sec|USAGE_STALE_SEC|pos-int|0|1800|positive integer, seconds|cutoff past which the usage record is treated as stale
 snooze_max_sec|SNOOZE_MAX_SEC|pos-int|0|3600|positive integer, seconds|cap on the duration a snooze accepts
 archive_days|ARCHIVE_DAYS|nonneg-int|0|30|nonnegative integer, days|minimum age at which prune treats an archived marker (accepted or rejected) as a cleanup candidate (older than this qualifies)
+lineage_idle_sec|LINEAGE_IDLE_SEC|nonneg-int|0|600|nonnegative integer, seconds (0 turns the check off)|how long the lineage may sit with no live primary session before the watcher reports the gap
 model|MODEL|string|0||string|model passed when launching the successor (the way to pin it across generations)
 settings|SETTINGS|string|1||string (can hold a secret)|settings passed when launching the successor (a file path or a JSON string)
 runtime_dir|RUNTIME_DIR|abs-path|0||absolute path|location of runtime data (markers, locks, heartbeat)

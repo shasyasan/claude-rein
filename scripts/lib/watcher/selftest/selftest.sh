@@ -95,7 +95,7 @@ EOF
 
 selftest() {
   local tmp case_dir kickoff_line daemon_rc tool hb_first hb_pointer bg_call st_default_handoff
-  local grace_started grace_elapsed grace_interval grace_limit
+  local grace_started grace_elapsed grace_interval grace_limit idle_calls
   local marker_epoch request_line quoted_argv expected_argv probe_out request_rc
   local fo_started fo_elapsed fo_archived
   # Section files share this function's locals through dynamic scope. Some variables cross

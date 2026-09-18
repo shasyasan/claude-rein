@@ -50,6 +50,7 @@ STOP_TIMEOUT_SEC=""
 MARKER_MAX_AGE_SEC=""
 MAX_CLOCK_SKEW_SEC=""
 HANDOFF_FRESH_WINDOW_SEC=""
+LINEAGE_IDLE_SEC=""
 WATCHER_LOG_MAX_BYTES=""
 CLAUDE_SETTINGS=""
 CLAUDE_MODEL=""
@@ -102,6 +103,12 @@ POINTER_GENERATION=""
 CLAIMED_MARKER=""
 SUCCESSOR_ID=""
 CONFIG_ERROR_LAST=""
+# The gap watch (see check_lineage_gap). All three are epoch seconds or a flag, and all three are
+# seeded the moment monitoring starts -- a watcher that has only just come up has not yet seen
+# this lineage go dark, so it must not count the time before it existed as part of the gap.
+LINEAGE_LAST_LIVE_AT=""
+LINEAGE_LAST_PROBE_AT=""
+LINEAGE_GAP_REPORTED=0
 RUNTIME_DIR_DRIFT_LAST=""
 STOP_REQUEST_REJECTED=0
 EXIT_REASON=""
@@ -309,6 +316,7 @@ load_config_values() {
   rein_config_bind HANDOFF_FRESH_WINDOW_SEC handoff_fresh_window_sec || return 1
   rein_config_bind WATCHER_LOG_MAX_BYTES watcher_log_max_bytes || return 1
   rein_config_bind CMD_TIMEOUT_SEC cmd_timeout_sec || return 1
+  rein_config_bind LINEAGE_IDLE_SEC lineage_idle_sec || return 1
   rein_config_bind CLAUDE_SETTINGS settings || return 1
   rein_config_bind CLAUDE_MODEL model || return 1
   rein_config_bind KICKOFF_NOTE_PATH kickoff_note_path || return 1
@@ -2435,6 +2443,81 @@ run_bootstrap() {
   return 0
 }
 
+# Report a lineage that has gone dark -- nobody is running it, and until now nobody would have
+# noticed.
+#
+# **The stretch between one session ending and the next one starting was the one thing this
+# mechanism never watched.** A handover that never completed, a session stopped by hand, a
+# successor whose launch went nowhere: the pointer goes on naming a session that no longer
+# exists, the watcher goes on polling for a marker that will never arrive, and the lineage sits
+# still. Measured once at about 7 hours of an unattended run with nothing running at all.
+#
+# **The probe is deliberately rare.** Enumerating sessions starts an external command and the
+# watch loop polls every few seconds, so probing per cycle would mean one `claude` per cycle for
+# as long as the watcher lives. Instead the first probe waits until `lineage_idle_sec` has passed
+# since a live session was last seen (seeded when monitoring starts) -- which is also the
+# earliest moment a report could be due. A healthy lineage therefore costs one enumeration per
+# `lineage_idle_sec`, and nothing at all before the first one falls due.
+#
+# **Undecidable is never read as a gap.** Enumeration that cannot be read (the CLI missing,
+# stalling, or answering with something that is not JSON) leaves the clock where it was: it is
+# not evidence that the seat is empty, and reporting off it would cry wolf on every hiccup. A
+# lineage with no valid pointer is not a gap either -- nothing names a session that should be
+# running there.
+#
+# Reports **once per dark spell**: the next report only comes after a live session has been seen
+# again. Repeating it every cycle would turn a single gap into an unbounded run of identical
+# lines and notifications.
+# 0 = carry on / 1 = the report could not be recorded (a stage failure, same as the heartbeat's)
+check_lineage_gap() {
+  local now detail rc
+  case "$LINEAGE_IDLE_SEC" in
+    '' | *[!0-9]* | 0) return 0 ;;
+  esac
+  now="$(rein_now_epoch)"
+  case "$now" in
+    '' | *[!0-9]*) return 0 ;;
+  esac
+  case "$LINEAGE_LAST_LIVE_AT" in
+    '' | *[!0-9]*) LINEAGE_LAST_LIVE_AT="$now" ;;
+  esac
+  case "$LINEAGE_LAST_PROBE_AT" in
+    '' | *[!0-9]*) LINEAGE_LAST_PROBE_AT="$now" ;;
+  esac
+  [ "$((now - LINEAGE_LAST_PROBE_AT))" -ge "$LINEAGE_IDLE_SEC" ] || return 0
+  # A request already waiting to be processed is not a gap -- the seat is supposed to be empty
+  # for the few seconds a handover takes, and the marker branch above is about to act on it.
+  [ -e "$MARKER_FILE" ] && return 0
+  rein_validate_pointer "$POINTER_FILE" "$TARGET_CWD" || return 0
+  # Stamped before the probe, not after: the probe itself can take as long as the external
+  # command cap, and timing the next one from when this one finished would stretch the interval
+  # by that much every round.
+  LINEAGE_LAST_PROBE_AT="$now"
+  rein_is_session_live "$REIN_POINTER_SESSION_ID"
+  rc=$?
+  case "$rc" in
+    0)
+      LINEAGE_LAST_LIVE_AT="$now"
+      LINEAGE_GAP_REPORTED=0
+      return 0
+      ;;
+    1) ;;
+    *) return 0 ;;
+  esac
+  [ "$LINEAGE_GAP_REPORTED" -eq 0 ] || return 0
+  [ "$((now - LINEAGE_LAST_LIVE_AT))" -ge "$LINEAGE_IDLE_SEC" ] || return 0
+  LINEAGE_GAP_REPORTED=1
+  # One string for all three readers (the watcher log, the handover log's detail, and the
+  # notification). Wording them separately leaves no way to tell which one to trust when the two
+  # disagree while tracing an incident -- the same rule every other reported event here follows.
+  printf -v detail 'the session the current pointer names is not running: session_id=%s idle_for=%s sec threshold=%s sec' \
+    "$REIN_POINTER_SESSION_ID" "$((now - LINEAGE_LAST_LIVE_AT))" "$LINEAGE_IDLE_SEC"
+  wlog "$detail"
+  log_event_or_fail "lineage_idle" "$detail" "$REIN_POINTER_GENERATION" || return 1
+  rein_notify "rein: nobody is running this lineage" "$detail"
+  return 0
+}
+
 run_watch() {
   local rc hrc detail
 
@@ -2609,6 +2692,9 @@ run_watch() {
       0) return 0 ;;
       2) return 1 ;;
     esac
+    # Placed before the heartbeat so the heartbeat lands right after the probe returns -- the
+    # probe is the one step in this loop that can take as long as the external command cap.
+    check_lineage_gap || return 1
     if ! write_heartbeat; then
       fail_heartbeat
       return 1
