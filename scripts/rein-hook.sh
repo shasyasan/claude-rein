@@ -117,6 +117,11 @@ HOOK_AT=""
 # the former as the latter would silently turn "lost the evidence" into "no children."
 HOOK_BG_TASKS_PRESENT=0
 HOOK_BG_TASKS_RUNNING=0
+# Whether the prompt this call carries is the harness's own background-task notification rather
+# than something the user typed (UserPromptSubmit only). Kept as a flag derived inside the same
+# jq call, never as the prompt itself: the prompt is multi-line by nature, and a value with a
+# newline in it would break the delimiter every other field is read through.
+HOOK_PROMPT_IS_NOTIFICATION=0
 
 # The lineage (its locations).
 TARGET_CWD=""
@@ -310,9 +315,10 @@ hook_ensure_dir() {
 # in `session_id` pushes its tail into `agent_id`, which makes the subagent check true (all
 # monitoring goes silent even past a crossed threshold -- indistinguishable, byte for byte, from
 # a real subagent's silence). The same holds for a non-string value: jq pretty-prints by
-# default, so a single object shifts two lines, and whether `background_tasks` is present (`0`)
-# lands where `now` should be, **making the current time epoch 0** (0 is a digit, so it passes
-# the check below, and the last-seen value shared across sessions gets smeared to 1970).
+# default, so a single object shifts two lines, and one of the derived flags that follow (every
+# one of them a bare `0` or `1`) lands where `now` should be, **making the current time epoch 0
+# or 1** (a digit, so it passes the check below, and the last-seen value shared across sessions
+# gets smeared to 1970).
 # All of this is closed within the same single jq call: (a) **reject any field that isn't a
 # string**, (b) `tostring` everything that's left (matching statusline), (c) put the rejection
 # flag on **the output's first line**. Because it comes before any user-derived data, the check
@@ -388,6 +394,12 @@ hook_read_input() {
       (if (.background_tasks | type) == "array"
        then ([ .background_tasks[] | select((.status? // "") == "running") ] | length)
        else 0 end),
+      (if (.prompt | type) == "string"
+       then ((.prompt | sub("^\\s+"; "") | sub("\\s+$"; "")) as $p
+             | if ($p | startswith("<task-notification>"))
+                  and ($p | endswith("</task-notification>"))
+               then "1" else "0" end)
+       else "0" end),
       (now | floor)' <<<"$HOOK_INPUT")" ||
     hook_die "cannot parse the hook's stdin as JSON"
   {
@@ -399,6 +411,7 @@ hook_read_input() {
     read -r HOOK_AGENT_TYPE
     read -r HOOK_BG_TASKS_PRESENT
     read -r HOOK_BG_TASKS_RUNNING
+    read -r HOOK_PROMPT_IS_NOTIFICATION
     read -r HOOK_NOW
   } <<EOF
 $fields
@@ -1780,6 +1793,24 @@ hook_user_prompt_submit() {
   # on isn't even this session's own.
   rein_validate_pointer "$POINTER_FILE" "$TARGET_CWD" || exit 0
   [ "$REIN_POINTER_SESSION_ID" = "$HOOK_SESSION_ID" ] || exit 0
+  # **Not every UserPromptSubmit is the user speaking.** The harness submits a prompt of its own
+  # when a background task finishes, and that prompt reaches this event exactly like a typed one
+  # (observed: a handover request was cancelled 20 seconds after it went out by a background
+  # job's completion notice, with the user nowhere near the keyboard, and no successor ever
+  # started). The payload names no origin -- `prompt` is the only thing that tells the two
+  # apart -- so what gets recognized is the notification's envelope, and only when the prompt is
+  # **nothing but** that envelope. Anything the user wrote around it means the prompt is no
+  # longer just the envelope and the cancellation goes through: the user speaking wins the tie.
+  # It sits after the pointer checks so the generation it records is the real one, and so a
+  # notification landing on a lineage this session doesn't own leaves no record here at all.
+  if [ "$HOOK_PROMPT_IS_NOTIFICATION" = "1" ]; then
+    # Folded to one line per generation, the same rule the other repeating notices follow -- a
+    # session that finishes twenty background jobs while a request is out would otherwise write
+    # twenty identical lines.
+    hook_log_once notification-prompt "g${REIN_POINTER_GENERATION}" "handover_cancel_skipped" \
+      "a background-task notification arrived while the handover for generation ${REIN_POINTER_GENERATION} was out; it is not the user speaking, so the handover was left alone"
+    exit 0
+  fi
   # The log line is **assembled before the marker is placed** (placing only the marker while it
   # can't be assembled would let the cancellation succeed with not a single line left in the
   # lineage log). The marker is written first -- reversed, a run that fails to place the marker
@@ -2254,6 +2285,7 @@ selftest() {
   local never_roots_seen never_roots_want fp_root fp_before fp_after
   local sess_start_bin sess_start_path_bare
   local handover_ready handover_cancel mark_mtime wait_latch
+  local notify_prompt notify_payload
   local runtime_token plain_token runtime2_token runtime3_token
 
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/rein-hook-selftest.XXXXXX")" || {
@@ -3483,9 +3515,9 @@ EOF
   st_expect_silent "a real subagent still stays silent as before"
 
   # A **non-string value** is rejected by type. Coercing it and letting it through would (a) let
-  # a multi-line value shift line positions, landing whether background_tasks is present (`0`)
-  # into HOOK_NOW and **making the current time epoch 0** (smearing last-seen, shared across
-  # sessions, to 0 -- the hooks liveness that doctor reads reverts to 1970), and (b) let a
+  # a multi-line value shift line positions, landing one of the trailing derived flags (a bare
+  # `0` or `1`) into HOOK_NOW and **making the current time epoch 0 or 1** (smearing last-seen,
+  # shared across sessions -- the hooks liveness that doctor reads reverts to 1970), and (b) let a
   # value that fits on one line (`agent_id: 0`) become the non-empty string `"0"` without
   # shifting any line, so **the hook goes silent and exits 0 on every event**. Both are closed
   # by this one type check at the entry point.
@@ -4502,6 +4534,67 @@ DATESHIM
     "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl" '{"agent_id":"a-9"}')"
   st_expect_silent "UserPromptSubmit in a subagent context stays silent"
   st_expect_true "never places the cancel marker in a subagent context" test ! -e "$handover_cancel"
+
+  # (f) **A prompt the harness submitted, not one the user typed.** When a background task
+  #     finishes, its completion notice comes in as a prompt and reaches this event exactly like
+  #     a typed one -- observed cancelling a handover 20 seconds after the request went out, with
+  #     the user nowhere near the keyboard and no successor ever launched. The payload names no
+  #     origin, so the notification's envelope is the only thing that tells the two apart.
+  #     The envelope here is the measured one, whitespace-padded, so the judgment cannot get away
+  #     with comparing the prompt byte for byte.
+  notify_prompt='
+<task-notification>
+<task-id>b0bjs9rx5</task-id>
+<status>completed</status>
+</task-notification>
+'
+  notify_payload="$(jq -nc --arg p "$notify_prompt" '{prompt: $p}')"
+  rm -f "$handover_cancel"
+  before="$(st_log_lines "$fire_log")"
+  log_before="$(st_log_lines "$hook_log")"
+  st_hook user-prompt-submit \
+    "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl" "$notify_payload")"
+  st_expect_silent "a background-task notification emits no output"
+  st_expect_true "a background-task notification never places the cancel marker" \
+    test ! -e "$handover_cancel"
+  st_expect_true "a background-task notification never reaches the fire log" \
+    test "$(st_log_lines "$fire_log")" -eq "$before"
+  st_expect_true "the lineage log records that the handover was left alone" \
+    test "$(st_log_lines "$hook_log")" -eq "$((log_before + 1))"
+  st_expect_true "the lineage log names it a skipped cancellation" \
+    test "$(jq -r 'select(.event == "handover_cancel_skipped") | .event' "$hook_log" | head -1)" = "handover_cancel_skipped"
+  # (f2) Folded to one line per generation. A session that finishes twenty background jobs while
+  #      a request is out would otherwise write twenty identical lines.
+  log_before="$(st_log_lines "$hook_log")"
+  st_hook user-prompt-submit \
+    "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl" "$notify_payload")"
+  st_expect_true "a second notification in the same generation grows no log" \
+    test "$(st_log_lines "$hook_log")" -eq "$log_before"
+  st_expect_true "a second notification still places no cancel marker" test ! -e "$handover_cancel"
+  # (g) The control side, and the direction the tie breaks. A prompt that **contains** the
+  #     envelope but is not only the envelope is the user writing about it, and the user speaking
+  #     always wins: the cancellation goes through as before.
+  rm -f "$handover_cancel"
+  st_hook user-prompt-submit \
+    "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl" \
+      "$(jq -nc --arg p "what does this mean? ${notify_prompt}" '{prompt: $p}')")"
+  st_expect_true "a prompt that only quotes the envelope still cancels" test -f "$handover_cancel"
+  # (g2) The neighbouring shape on the other end: the opening tag is there, the closing one is
+  #      not. Matching on the opening alone would swallow a prompt the user started with that
+  #      text and silently refuse to cancel their own handover.
+  rm -f "$handover_cancel"
+  st_hook user-prompt-submit \
+    "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl" \
+      "$(jq -nc '{prompt: "<task-notification> and then I kept typing"}')")"
+  st_expect_true "an unclosed envelope still cancels" test -f "$handover_cancel"
+  # (h) Judgment material that is not there or not a string. A payload with no prompt at all
+  #     (every case above this one) and a prompt that is a number both leave nothing to
+  #     recognize -- and "cannot tell" has to fall to the side that honors the user.
+  rm -f "$handover_cancel"
+  st_hook user-prompt-submit \
+    "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl" '{"prompt": 12}')"
+  st_expect_true "a non-string prompt still cancels" test -f "$handover_cancel"
+
   rm -f "$marker" "$handover_cancel"
 
   # SessionStart.

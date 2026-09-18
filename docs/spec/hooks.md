@@ -392,6 +392,7 @@ The fact that a stop was blocked, the fact that a snooze let it pass through, or
 | `stop_blocked_request_rejected` | Re-blocked the stop (once, for a generation whose handover request was rejected; `detail` carries the rejection reason verbatim) |
 | `stop_snoozed` | Passed through because of a snooze |
 | `handover_cancel_requested` | Requested cancellation of the handover because the user spoke (`UserPromptSubmit`) |
+| `handover_cancel_skipped` | A prompt arrived while a handover was out, but it was the harness's own background-task notification rather than the user speaking, so the handover was left alone (`UserPromptSubmit`) |
 | `handover_deferred` | Deferred that generation's handover because a child was running |
 | `children_probe_degraded` | Fell back because the payload had no evidence for the children check |
 
@@ -399,6 +400,7 @@ The fact that a stop was blocked, the fact that a snooze let it pass through, or
 - The firing log's `reason` **for a stop block** is split the same 3 ways (`handover:<%>` / `watcher-missing` / `request-rejected:<%>`); the handover-wait notice is a separate `decision` there (`notice`) and reaches this log not at all.
 - `stop_snoozed` is **never piled up for the same snooze (the same `until`)** -- `Stop` runs at every turn boundary, so writing it unconditionally would keep growing the log until the snooze expires.
 - `children_probe_degraded` follows the same rule, logged only once.
+- `handover_cancel_skipped` is folded to one line per generation, for the same reason -- a session that finishes twenty background jobs while a request is out would otherwise write twenty identical lines.
 
 ## The conditions under which UserPromptSubmit cancels a handover
 
@@ -410,8 +412,14 @@ The cancellation marker (`<runtime>/handover-cancel`, containing one line: the `
 | --- | --- |
 | This session's own handover request is submitted | Either `<runtime>/handover-request.json`'s `session_id` is this session's own, or `<runtime>/processing/` has a claimed marker for this session's own `session_id` (the same single check as Stop's condition table) |
 | Scope: only the primary session under rein's management | The lineage's records location has a `current.json` that passes contract validation, and its `session_id` matches the hook's `session_id` |
+| The prompt is the user speaking | The payload's `prompt`, with surrounding whitespace trimmed, is **not** a bare background-task notification -- i.e. not a string that both starts with `<task-notification>` and ends with `</task-notification>` |
 
+- **Not every `UserPromptSubmit` is the user speaking.** When a background task finishes, the harness submits its completion notice as a prompt, and it arrives at this event exactly like a typed one. Observed: a handover request was cancelled 20 seconds after it went out by a background job's completion notice, with the user nowhere near the keyboard, no successor ever launched, and not a single message from the user in that conversation.
+  - **The payload names no origin.** Measured against a real session, a `UserPromptSubmit` payload carries `session_id` / `transcript_path` / `cwd` / `prompt_id` / `permission_mode` / `hook_event_name` / `prompt`, and nothing else -- for a typed prompt and for a notification alike. The conversation record does mark the difference (`commandMode: "task-notification"` on the entry), but this event fires before that record is written, so `prompt` is the only material there is.
+  - **Only a prompt that is nothing but the envelope counts as machine-sent.** Anything the user wrote around it means the prompt is no longer just the envelope, and the cancellation goes through: where the two readings collide, the user speaking wins. A prompt that is missing or is not a string is the same -- there is nothing to recognize, so it cancels.
+  - A skipped cancellation leaves **one `handover_cancel_skipped` line per generation** in `hooks.log` and nothing in the firing log (no marker was placed, so there was no firing to record).
 - **The submitted check is placed first** -- on a call where no handover request has been made (most turns where the user speaks), it returns cheaply right there. Pointer contract validation spawns `jq` 5 times, so reversing the order would make every ordinary conversational turn that much heavier.
+- **The prompt check is placed last**, after the pointer checks, even though it is the cheapest of them (the flag is derived inside the payload's single `jq` call, so testing it costs nothing). Its record names the generation, which only pointer validation can supply, and a notification landing on a lineage this session does not own should leave no line here at all. It is only ever reached on a call where a request is already out, which is not an ordinary turn.
 - **The generation latch is left untouched** -- for a cancelled generation, Stop's handover trigger stays consumed, and rein's side never pushes for a handover again for that generation. Having a handover happen while the user has stepped away would be a problem, and a cancellation is itself the user saying "I want this session to finish this" -- so **the user's own request outranks rein's.** If the user later wants a handover after all, the session just resubmits the request, and it goes through as usual (consuming the latch and completing a handover are independent).
 - **A lineage with `final_output_timeout_sec` set to `0` gets neither the marker nor a log line** (the watcher has no step at all that reads a cancellation, so the log never ends up claiming "cancellation requested" on its own).
 - **If the marker already exists and already names this session, it returns without writing a log line or a firing-log line either** -- folding only the write would still let the log side grow on every prompt while the same state persists (this matches the existing rule of folding an identical repetition down to one).
