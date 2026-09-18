@@ -1784,6 +1784,51 @@ rein_child_active_at() {
   [ "$((now - latest))" -le "$REIN_CHILD_ACTIVE_SEC" ]
 }
 
+# The text a child's record ends on once it has been stopped from outside (observed across 1747
+# subagent records: the 62 that had been stopped end on a `user` entry whose text is exactly
+# this, and the only other spelling anywhere in that sample is the same line with
+# ` for tool use]` in place of `]` -- so the match is on the prefix, not the whole line).
+REIN_CHILD_STOPPED_MARK='[Request interrupted by user'
+
+# Has this child been stopped from outside? **The expiry cutoff alone cannot answer this.**
+# Stopping a child externally (the parent's own stop call, the user interrupting it) delivers no
+# SubagentStop, so its ledger entry stays behind and its record stops being written -- and until
+# the cutoff expires, both readers go on counting a child that is already gone as running. The
+# one piece of evidence left is the record's **last** line: a child resumed after an
+# interruption has further lines after it, so looking anywhere but the end would read a
+# long-finished interruption as the current state.
+#
+# **Undecidable is never flattened into "stopped."** No record, an unreadable one, or a last
+# line that is not JSON each mean the evidence is missing, not that the child ended, and the
+# caller has to go on counting it as running (refusing a handover is the safe side -- a handover
+# replaces the parent and its children die with it).
+# 0 = stopped from outside / 1 = not stopped / 2 = cannot be determined
+rein_child_record_stopped() {
+  local record="$1" last verdict
+  [ -n "$record" ] || return 2
+  [ -f "$record" ] || return 2
+  [ -r "$record" ] || return 2
+  last="$(tail -n 1 "$record" 2>/dev/null)"
+  [ -n "$last" ] || return 2
+  # A non-object line, a `message` that is not an object, and a `content` that is neither an
+  # array nor a string all fall through to "no matching text" rather than erroring out -- the
+  # record's shape is observed, not documented, so a shape that does not match reads as "this is
+  # not an interruption", while a line jq cannot parse at all stays undecidable below.
+  verdict="$(printf '%s' "$last" | jq -r --arg mark "$REIN_CHILD_STOPPED_MARK" '
+    (if type == "object" then . else {} end) as $e
+    | (if ($e.type? // "") == "user" then ($e.message?.content? // null) else null end) as $c
+    | (if ($c | type) == "array" then [ $c[] | (.text? // "") ]
+       elif ($c | type) == "string" then [ $c ]
+       else [] end) as $texts
+    | (if any($texts[]; type == "string" and startswith($mark)) then "1" else "0" end)' 2>/dev/null)" ||
+    return 2
+  case "$verdict" in
+    1) return 0 ;;
+    0) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
 # Pulls one human-readable line out of some output (the last non-blank line; an overlong line
 # is truncated). Since a failure reason ends up in the handover log's detail field, the cause
 # string is cleaned up here rather than discarded.

@@ -447,6 +447,14 @@ require_no_live_children() {
   dir="$RUNTIME_DIR/$REIN_CHILDREN_DIRNAME"
   [ -d "$dir" ] || return 0
   now="$(rein_now_epoch)"
+# **The cutoff is not the only way an entry stops counting.** A child stopped from outside
+# (the parent's own stop call, the user interrupting it) delivers no SubagentStop either, so its
+# entry stays and its record goes quiet -- and reading the cutoff alone refused every handover
+# for the whole 900 seconds after a child was deliberately stopped (observed 3 times). So the
+# record's **last line** is read too, and an entry whose child ends on an interruption is not
+# counted. Evidence that cannot be read is never flattened into "stopped" -- it keeps counting,
+# which is the safe side.
+#
   # Selected by **building the prefix out of this session's own id**, never by splitting a name on
   # `.` -- a session_id may legitimately contain one (only a path separator and whitespace are
   # rejected), so splitting would attribute another session's entry to this one.
@@ -487,6 +495,10 @@ require_no_live_children() {
       '' | *[!0-9]*) age="its start time is not recorded" ;;
       *) age="running for $((now - started)) seconds" ;;
     esac
+    # The stopped judgment goes through the same shared function the hooks' fallback uses -- two
+    # readers disagreeing about whether a child has been stopped would refuse a handover on one
+    # side and allow it on the other for that very same child.
+    rein_child_record_stopped "$record" && continue
     printf -v detail '%s%s%s (agent %s, %s)' \
       "$detail" "${detail:+, }" "${agent_type:-unknown}" "$agent_id" "$age"
   done
@@ -1072,6 +1084,12 @@ selftest() {
   #     SubagentStop, so leftovers always exist -- reading them would refuse every handover from
   #     here on).
   case_dir="$tmp/child-other-session"
+  local st_handoff_mtime st_window st_broken
+  # The one line a stopped child's record ends on, both spellings, and an ordinary line for the
+  # control side. Declared here rather than at file scope so a production run never carries them.
+  local ST_CHILD_STOPPED_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'
+  local ST_CHILD_STOPPED_TOOL_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}'
+  local ST_CHILD_RUNNING_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}'
   st_setup_case "$case_dir"
   mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
   printf 'Explore\n%s\n\n' "$(rein_now_epoch)" \
@@ -1220,6 +1238,135 @@ selftest() {
   if st_expect_status "writes fine with no optional fields" 0; then
     if [ "$(jq -r 'has("successor_name"), has("note")' "$ST_MARKER" | tr '\n' ' ')" = "false false " ]; then
       st_ok
+  # (g) A child stopped from outside. No SubagentStop is delivered, so its ledger entry stays
+  #     and its record is still well inside the cutoff -- the cutoff alone reads it as running,
+  #     which refused every handover for the whole 900 seconds after a deliberate stop (observed
+  #     3 times). The record's last line is what settles it.
+  case_dir="$tmp/child-stopped"
+  st_setup_case "$case_dir"
+  mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
+  st_write_child_record "$ST_CWD/records/agent-a1.jsonl" "$ST_CHILD_STOPPED_LINE"
+  printf 'Explore\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a1.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-stopped.a1"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-stopped" --handoff "$ST_HANDOFF"
+  if st_expect_status "a child stopped from outside never refuses the handover" 0; then
+    if [ -f "$ST_MARKER" ]; then
+      st_ok
+    else
+      st_fail "places the marker once the only child has been stopped" "${ST_MARKER} is missing: ${ST_OUT}"
+    fi
+  fi
+  # (h) The second spelling of the same stop. Matching the whole line instead of its opening
+  #     would take this one for a still-running child.
+  case_dir="$tmp/child-stopped-tool-use"
+  st_setup_case "$case_dir"
+  mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
+  st_write_child_record "$ST_CWD/records/agent-a1.jsonl" "$ST_CHILD_STOPPED_TOOL_LINE"
+  printf 'Explore\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a1.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-stopped2.a1"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-stopped2" --handoff "$ST_HANDOFF"
+  if st_expect_status "the tool-use spelling of the stop is recognized too" 0; then
+    if [ -f "$ST_MARKER" ]; then
+      st_ok
+    else
+      st_fail "places the marker for the tool-use spelling too" "${ST_MARKER} is missing: ${ST_OUT}"
+    fi
+  fi
+  # (i) The control side. A child whose record ends on an ordinary line is still running, and
+  #     reading the record must not turn every child into a stopped one.
+  case_dir="$tmp/child-record-running"
+  st_setup_case "$case_dir"
+  mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
+  st_write_child_record "$ST_CWD/records/agent-a1.jsonl" "$ST_CHILD_RUNNING_LINE"
+  printf 'Explore\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a1.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-alive.a1"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-alive" --handoff "$ST_HANDOFF"
+  st_reject_case "a child whose record ends on an ordinary line still refuses" 1 \
+    "still has 1 running child agent"
+  # (j) The boundary next door: a child interrupted and then **resumed**. The interruption is in
+  #     the record, just not at the end. Scanning the whole file instead of its last line would
+  #     read a long-finished interruption as the child's current state and let a handover
+  #     replace a parent whose child is running again.
+  case_dir="$tmp/child-resumed-after-stop"
+  st_setup_case "$case_dir"
+  mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
+  st_write_child_record "$ST_CWD/records/agent-a1.jsonl" "$ST_CHILD_STOPPED_LINE"
+  printf '%s\n' "$ST_CHILD_RUNNING_LINE" >>"$ST_CWD/records/agent-a1.jsonl"
+  printf 'Explore\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a1.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-resumed.a1"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-resumed" --handoff "$ST_HANDOFF"
+  st_reject_case "a child resumed after an interruption still refuses" 1 \
+    "still has 1 running child agent"
+  # (k) Evidence that cannot be read is never read as "stopped". A last line that is not JSON,
+  #     and a record that is there but empty, both mean the judgment has no material -- and
+  #     letting a handover through on no material replaces a parent whose child may be alive.
+  for st_broken in 'this line is not json' ''; do
+    case_dir="$tmp/child-record-unreadable-${#st_broken}"
+    st_setup_case "$case_dir"
+    mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
+    mkdir -p "$ST_CWD/records"
+    printf '%s' "$st_broken" >"$ST_CWD/records/agent-a1.jsonl"
+    printf 'Explore\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a1.jsonl" \
+      >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-unreadable.a1"
+    st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+      --session-id "sess-unreadable" --handoff "$ST_HANDOFF"
+    st_reject_case "a record that cannot be judged still refuses (len=${#st_broken})" 1 \
+      "still has 1 running child agent"
+  done
+  # (l) Two children, one stopped and one running. The refusal has to survive the stopped one
+  #     being discounted, and its count and detail have to name only the one still running --
+  #     a judgment applied to the wrong entry would show up here as a count of 2.
+  case_dir="$tmp/child-mixed"
+  st_setup_case "$case_dir"
+  mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
+  st_write_child_record "$ST_CWD/records/agent-a1.jsonl" "$ST_CHILD_STOPPED_LINE"
+  st_write_child_record "$ST_CWD/records/agent-a2.jsonl" "$ST_CHILD_RUNNING_LINE"
+  printf 'Explore\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a1.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-mixed.a1"
+  printf 'Plan\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a2.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-mixed.a2"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-mixed" --handoff "$ST_HANDOFF"
+  st_reject_case "one stopped child never excuses the one still running" 1 \
+    "still has 1 running child agent"
+  case "$ST_OUT" in
+    *"agent a2"*) st_ok ;;
+    *) st_fail "the refusal names the child that is still running" "$ST_OUT" ;;
+  esac
+  case "$ST_OUT" in
+    *"agent a1"*) st_fail "the refusal leaves the stopped child out" "$ST_OUT" ;;
+    *) st_ok ;;
+  esac
+  # (m) Both children stopped -- the state the handover was actually blocked in. Nothing is left
+  #     to protect, so the request goes through.
+  case_dir="$tmp/child-all-stopped"
+  st_setup_case "$case_dir"
+  mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
+  st_write_child_record "$ST_CWD/records/agent-a1.jsonl" "$ST_CHILD_STOPPED_LINE"
+  st_write_child_record "$ST_CWD/records/agent-a2.jsonl" "$ST_CHILD_STOPPED_TOOL_LINE"
+  printf 'Explore\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a1.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-allstopped.a1"
+  printf 'Plan\n%s\n%s\n' "$(rein_now_epoch)" "$ST_CWD/records/agent-a2.jsonl" \
+    >"$ST_RUNTIME/$REIN_CHILDREN_DIRNAME/sess-allstopped.a2"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-allstopped" --handoff "$ST_HANDOFF"
+  if st_expect_status "a session whose every child has been stopped hands over" 0; then
+    if [ -f "$ST_MARKER" ]; then
+      st_ok
+    else
+      st_fail "places the marker once every child has been stopped" "${ST_MARKER} is missing: ${ST_OUT}"
+    fi
+  fi
+
+  # The handoff document's mtime. The tool guarantees R7 by touching the document right before
+  # publishing, but touching one that is **already** inside R7's window buys nothing and costs
+  # something: a review that keys off the document's mtime reads bytes that never changed as
+  # newly edited and demands another full pass over it (measured -- a request, then the same
+  # request re-issued after a cancellation, cost two passes over an unchanged document).
     else
       st_fail "omits an omitted optional field entirely" "$(cat "$ST_MARKER")"
     fi

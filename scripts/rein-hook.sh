@@ -1322,9 +1322,12 @@ hook_children_active_by_mtime() {
     # The expiry cutoff goes through the shared judgment (the same one the handover request
     # applies to a ledger entry) -- two readers expiring a child at different moments would let
     # a handover be refused by one and allowed by the other for the very same child.
-    if rein_child_active_at "$(rein_mtime "$file")" "$HOOK_NOW"; then
-      return 0
-    fi
+    rein_child_active_at "$(rein_mtime "$file")" "$HOOK_NOW" || continue
+    # A child stopped from outside goes quiet without ever delivering SubagentStop, so its
+    # record stays fresh enough to pass the cutoff while the child itself is gone. The last
+    # line settles it, through the same shared function the handover request uses.
+    rein_child_record_stopped "$file" && continue
+    return 0
   done < <(find "$dir" -maxdepth 1 -type f -name 'agent-*.jsonl' -print0 2>/dev/null)
   return 1
 }
@@ -3659,6 +3662,25 @@ EOF
   st_expect_true "a pass-through never grows the lineage log" \
     test "$(st_log_lines "$hook_log")" -eq "$before"
 
+  # On that same fallback, a child whose record ends on an interruption is **not** running --
+  # even though the record is fresh enough to clear the cutoff. A child stopped from outside
+  # delivers no SubagentStop, so freshness alone goes on deferring the handover for the whole
+  # cutoff; the request side had the same defect, and both sides have to expire it on the same
+  # evidence or one would defer a child the other had already let go.
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}' \
+    >"$transcripts/sess-stop/subagents/agent-1.jsonl"
+  st_hook stop "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl")"
+  st_expect_json "a child stopped from outside no longer defers the handover" '.decision == "block"'
+  rm -f "$hook_state/stop-latch.g1"
+  # The control side. A record ending on an ordinary line is a child still working, and the
+  # handover keeps deferring -- without this, reading every child as stopped would pass the case
+  # above while quietly replacing parents whose children are alive.
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}' \
+    >"$transcripts/sess-stop/subagents/agent-1.jsonl"
+  st_hook stop "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl")"
+  st_expect_silent "a child still writing its record keeps deferring the handover"
+  st_expect_true "a deferred turn never consumes the latch" test ! -e "$hook_state/stop-latch.g1"
+  : >"$transcripts/sess-stop/subagents/agent-1.jsonl"
   # A generation whose handover request was **rejected** reverts to "not submitted" while the
   # normal latch stays consumed -- meaning the stop for that generation can never be blocked
   # again (the forced handover disappears entirely). If the rejection archive has a reason
