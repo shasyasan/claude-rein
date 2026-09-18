@@ -495,6 +495,10 @@ require_no_live_children() {
       esac
     fi
     rein_child_active_at "$latest" "$now" || continue
+    # The stopped judgment goes through the same shared function the hooks' fallback uses -- two
+    # readers disagreeing about whether a child has been stopped would refuse a handover on one
+    # side and allow it on the other for that very same child.
+    rein_child_record_stopped "$record" && continue
     count=$((count + 1))
     agent_id="${name#"$SESSION_ID".}"
     # A ledger entry whose start time is unreadable still counts as a running child -- what it
@@ -503,10 +507,6 @@ require_no_live_children() {
       '' | *[!0-9]*) age="its start time is not recorded" ;;
       *) age="running for $((now - started)) seconds" ;;
     esac
-    # The stopped judgment goes through the same shared function the hooks' fallback uses -- two
-    # readers disagreeing about whether a child has been stopped would refuse a handover on one
-    # side and allow it on the other for that very same child.
-    rein_child_record_stopped "$record" && continue
     printf -v detail '%s%s%s (agent %s, %s)' \
       "$detail" "${detail:+, }" "${agent_type:-unknown}" "$agent_id" "$age"
   done
@@ -1084,6 +1084,12 @@ selftest() {
   local st_nr_records st_nr_handoff st_nr_mtime
   local st_section st_missing_section st_extra_section st_fenced_section st_fence
   local st_hint_root st_hint_key st_child_epoch
+  local st_handoff_mtime st_window st_broken
+  # The one line a stopped child's record ends on, both spellings, and an ordinary line for the
+  # control side. Declared here rather than at file scope so a production run never carries them.
+  local ST_CHILD_STOPPED_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'
+  local ST_CHILD_STOPPED_TOOL_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}'
+  local ST_CHILD_RUNNING_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}'
 
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/rein-request-selftest.XXXXXX")" || {
     printf '%s: selftest 0 pass / 1 fail\n' "$SCRIPT_NAME"
@@ -1164,12 +1170,6 @@ selftest() {
   #     SubagentStop, so leftovers always exist -- reading them would refuse every handover from
   #     here on).
   case_dir="$tmp/child-other-session"
-  local st_handoff_mtime st_window st_broken
-  # The one line a stopped child's record ends on, both spellings, and an ordinary line for the
-  # control side. Declared here rather than at file scope so a production run never carries them.
-  local ST_CHILD_STOPPED_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}'
-  local ST_CHILD_STOPPED_TOOL_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}'
-  local ST_CHILD_RUNNING_LINE='{"type":"user","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}'
   st_setup_case "$case_dir"
   mkdir -p "$ST_RUNTIME/$REIN_CHILDREN_DIRNAME"
   printf 'Explore\n%s\n\n' "$(rein_now_epoch)" \

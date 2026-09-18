@@ -271,9 +271,9 @@ The handover log is **JSON Lines, one event per line** -- append-only, never tru
 | `handover_completed` | The handover completed every stage |
 | `successor_orphaned` | A successor launched for a handover that didn't go through couldn't be identified or stopped, and was left behind outside management (`generation` is `null`) |
 | `successor_stopped` | A successor launched for a handover that didn't go through was retired with `claude stop` (`generation` is `null`) |
+| `lineage_idle` | Nobody is running this lineage: the session the current pointer names is not alive, and the gap has outlasted `lineage_idle_sec` (`detail` carries the session ID, how long the gap has run, and the threshold) |
 | `failed` | Some stage failed or timed out (`detail` carries the stage and the reason) |
 
-| `lineage_idle` | Nobody is running this lineage: the session the current pointer names is not alive, and the gap has outlasted `lineage_idle_sec` (`detail` carries the session ID, how long the gap has run, and the threshold) |
 - **A rejection is recorded only as `marker_rejected`** (never also as a `failed` for the same reason). Rejection has its own independent vocabulary in the event set, and double-logging it would make it impossible for an audit log to tell "one input error" apart from "one mechanism malfunction." `failed` is used only for a stage failure.
 - **A cancellation's `generation` is `null`, with the generation it was accepted as kept in `detail`** -- since the pointer never advances, the next successful handover reuses that same number. Putting the number itself in the top-level field would let an audit confuse 2 separate handovers, but which acceptance disappeared can still be traced.
 - **A cancellation is never the same event as a rejection** -- a rejection is a defect in the request itself (fixable), while a cancellation is the user deliberately stopping it (nothing to fix); the next step differs between them. Their archive destinations differ too (see [the locations and locks specification](runtime.md)).
@@ -350,9 +350,9 @@ The handover log is **JSON Lines, one event per line** -- append-only, never tru
 | External command cap, log cap | Positive integer |
 | Cooldown duration, usage freshness, escape-hatch cap (`notice_cooldown_sec` / `usage_stale_sec` / `snooze_max_sec`) | Positive integer (`0` isn't allowed) |
 | Threshold | 0 to 100 |
+| Gap watch (`lineage_idle_sec`) | Non-negative integer (`0` turns the check off, the same way `final_output_timeout_sec` set to `0` turns the final-output wait off) |
 | `--max-attach` (outside the settings layer -- the attach loop checks this one itself) | Non-negative integer |
 
-| Gap watch (`lineage_idle_sec`) | Non-negative integer (`0` turns the check off, the same way `final_output_timeout_sec` set to `0` turns the final-output wait off) |
 - **`0` never means "no cooldown" or "the escape hatch is disabled"** -- these 3 values only accept positive integers, and `0` is rejected on the type side (settings never carries a value that silently disables a feature).
 - Without this check, `sleep abc` would just return non-zero in 0.004 seconds -- silently collapsing into **a loop that never waits** (pegging the CPU while hammering enumeration). Likewise, an invalid wait cap would silently collapse to `deadline=0`, i.e. waiting forever.
 

@@ -3662,6 +3662,25 @@ EOF
   st_expect_true "a fallback turn never consumes the latch either" test ! -e "$hook_state/stop-latch.g1"
   st_expect_true "leaves the fallback in the lineage log" \
     test "$(jq -r 'select(.event == "children_probe_degraded") | .event' "$hook_log" | head -1)" = "children_probe_degraded"
+  # On that same fallback, a child whose record ends on an interruption is **not** running --
+  # even though the record is fresh enough to clear the cutoff. A child stopped from outside
+  # delivers no SubagentStop, so freshness alone goes on deferring the handover for the whole
+  # cutoff; the request side had the same defect, and both sides have to expire it on the same
+  # evidence or one would defer a child the other had already let go.
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}' \
+    >"$transcripts/sess-stop/subagents/agent-1.jsonl"
+  st_hook stop "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl")"
+  st_expect_json "a child stopped from outside no longer defers the handover" '.decision == "block"'
+  rm -f "$hook_state/stop-latch.g1"
+  # The control side. A record ending on an ordinary line is a child still working, and the
+  # handover keeps deferring -- without this, reading every child as stopped would pass the case
+  # above while quietly replacing parents whose children are alive.
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}' \
+    >"$transcripts/sess-stop/subagents/agent-1.jsonl"
+  st_hook stop "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl")"
+  st_expect_silent "a child still writing its record keeps deferring the handover"
+  st_expect_true "a deferred turn never consumes the latch" test ! -e "$hook_state/stop-latch.g1"
+  : >"$transcripts/sess-stop/subagents/agent-1.jsonl"
   touch -t 202001010000 "$transcripts/sess-stop/subagents/agent-1.jsonl"
 
   # Once every condition is met, blocks the stop **once per generation**.
@@ -3694,25 +3713,6 @@ EOF
   st_expect_true "a pass-through never grows the lineage log" \
     test "$(st_log_lines "$hook_log")" -eq "$before"
 
-  # On that same fallback, a child whose record ends on an interruption is **not** running --
-  # even though the record is fresh enough to clear the cutoff. A child stopped from outside
-  # delivers no SubagentStop, so freshness alone goes on deferring the handover for the whole
-  # cutoff; the request side had the same defect, and both sides have to expire it on the same
-  # evidence or one would defer a child the other had already let go.
-  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}' \
-    >"$transcripts/sess-stop/subagents/agent-1.jsonl"
-  st_hook stop "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl")"
-  st_expect_json "a child stopped from outside no longer defers the handover" '.decision == "block"'
-  rm -f "$hook_state/stop-latch.g1"
-  # The control side. A record ending on an ordinary line is a child still working, and the
-  # handover keeps deferring -- without this, reading every child as stopped would pass the case
-  # above while quietly replacing parents whose children are alive.
-  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"keep going"}]}}' \
-    >"$transcripts/sess-stop/subagents/agent-1.jsonl"
-  st_hook stop "$(rein_st_hook_payload sess-stop "$proj" "$transcripts/sess-stop.jsonl")"
-  st_expect_silent "a child still writing its record keeps deferring the handover"
-  st_expect_true "a deferred turn never consumes the latch" test ! -e "$hook_state/stop-latch.g1"
-  : >"$transcripts/sess-stop/subagents/agent-1.jsonl"
   # A generation whose handover request was **rejected** reverts to "not submitted" while the
   # normal latch stays consumed -- meaning the stop for that generation can never be blocked
   # again (the forced handover disappears entirely). If the rejection archive has a reason
