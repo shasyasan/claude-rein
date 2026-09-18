@@ -58,6 +58,8 @@ NOTE=""
 
 RUNTIME_DIR=""
 HANDOFF_PATH=""
+HANDOFF_FRESH_WINDOW_SEC=""
+MAX_CLOCK_SKEW_SEC=""
 
 usage() {
   cat <<EOF
@@ -169,6 +171,12 @@ load_config() {
   fi
   rein_config_bind HANDOFF_PATH handoff_path || return 1
   rein_config_bind RUNTIME_DIR runtime_dir || return 1
+  # The two bounds of R7, read from the same config the watcher validates R7 with. The writer
+  # needs them to tell whether the document is **already** inside the window it is about to be
+  # judged against (see publish_marker) -- a second spelling of either bound here would let the
+  # writer's idea of "already current" drift away from the reader's rule.
+  rein_config_bind HANDOFF_FRESH_WINDOW_SEC handoff_fresh_window_sec || return 1
+  rein_config_bind MAX_CLOCK_SKEW_SEC max_clock_skew_sec || return 1
   RUNTIME_DIR="$(rein_resolve_runtime_dir "$TARGET_CWD" "$RUNTIME_DIR")"
   if [ -z "$RUNTIME_DIR" ]; then
     fail "cannot resolve where runtime data is kept (set it explicitly with --runtime-dir)"
@@ -439,14 +447,6 @@ require_watcher_present() {
 # there yet, the moment of registration stands in for it, so a child registered seconds ago is
 # never read as expired.
 #
-# **There is no escape hatch on purpose.** A `--force` would place the marker, the watcher would
-# replace this session, and the children would die anyway -- nothing is rescued by overriding it.
-# 0 = no running children / 1 = refuse (the reason has already gone to stderr)
-require_no_live_children() {
-  local dir file name agent_id agent_type started record mtime latest age now count=0 detail="" reason
-  dir="$RUNTIME_DIR/$REIN_CHILDREN_DIRNAME"
-  [ -d "$dir" ] || return 0
-  now="$(rein_now_epoch)"
 # **The cutoff is not the only way an entry stops counting.** A child stopped from outside
 # (the parent's own stop call, the user interrupting it) delivers no SubagentStop either, so its
 # entry stays and its record goes quiet -- and reading the cutoff alone refused every handover
@@ -455,6 +455,14 @@ require_no_live_children() {
 # counted. Evidence that cannot be read is never flattened into "stopped" -- it keeps counting,
 # which is the safe side.
 #
+# **There is no escape hatch on purpose.** A `--force` would place the marker, the watcher would
+# replace this session, and the children would die anyway -- nothing is rescued by overriding it.
+# 0 = no running children / 1 = refuse (the reason has already gone to stderr)
+require_no_live_children() {
+  local dir file name agent_id agent_type started record mtime latest age now count=0 detail="" reason
+  dir="$RUNTIME_DIR/$REIN_CHILDREN_DIRNAME"
+  [ -d "$dir" ] || return 0
+  now="$(rein_now_epoch)"
   # Selected by **building the prefix out of this session's own id**, never by splitting a name on
   # `.` -- a session_id may legitimately contain one (only a path separator and whitespace are
   # rejected), so splitting would attribute another session's entry to this one.
@@ -593,6 +601,39 @@ drop_own_handover_marks() {
   return 0
 }
 
+# Is the handoff document's mtime already inside the window the reader will judge it against?
+# That window is R7's, spelled here exactly as the watcher spells it: mtime must be no older
+# than `requested_at - handoff_fresh_window_sec` and no newer than `requested_at +
+# max_clock_skew_sec` (see the freshness rules in the handover specification). Both bounds are
+# read from the same config keys the watcher binds, so the writer never grows a second, drifting
+# copy of the rule. R8 (mtime not in the future relative to the watcher's own `now`) needs no
+# separate test: the watcher judges strictly later than `requested_at`, so an mtime that clears
+# this upper bound clears R8 too.
+# **Anything that cannot be measured answers "no."** An unreadable mtime, a timestamp that will
+# not parse, a bound that is not a number -- skipping the touch on any of those would hand the
+# watcher a marker R7 rejects, on no evidence at all. Answering "no" costs one touch.
+# 0 = already satisfies R7, nothing to do / 1 = does not, or cannot be told
+handoff_mtime_satisfies_r7() {
+  local requested_at="$1" epoch mtime
+  epoch="$(rein_iso_to_epoch "$requested_at")" || return 1
+  case "$epoch" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  mtime="$(rein_mtime "$HANDOFF_PATH")"
+  case "$mtime" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  case "$HANDOFF_FRESH_WINDOW_SEC" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  case "$MAX_CLOCK_SKEW_SEC" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ "$mtime" -ge "$((epoch - HANDOFF_FRESH_WINDOW_SEC))" ] || return 1
+  [ "$mtime" -le "$((epoch + MAX_CLOCK_SKEW_SEC))" ] || return 1
+  return 0
+}
+
 publish_marker() {
   local marker_file="$1" requested_at marker_json rc
   if [ -e "$marker_file" ]; then
@@ -608,13 +649,23 @@ publish_marker() {
   fi
 
   # The tool guarantees the handoff-document-before-marker order (R7 checks that the document
-  # wasn't left stale before the marker). This touch, not a window value, is what closes off the
+  # wasn't left stale before the marker). The touch, not a window value, is what closes off the
   # gap where the document could go stale for however long verification takes.
-  if ! touch "$HANDOFF_PATH"; then
-    fail "cannot update the handoff document's mtime: ${HANDOFF_PATH}"
-    return 1
-  fi
+  #
+  # **It only touches when R7 would otherwise fail.** Bumping the mtime of a document that is
+  # already inside the window changes nothing about whether the request is accepted, and it does
+  # change something outside rein: reviews that key off the document's mtime read the untouched
+  # document as newly edited and demand a re-review, so every request -- including one merely
+  # re-issued after a cancellation -- cost a full pass over a document whose bytes never moved.
+  # `requested_at` is settled first so the decision is made against the very timestamp the marker
+  # will carry, not against a `now` that drifts from it.
   requested_at="$(rein_iso_now)"
+  if ! handoff_mtime_satisfies_r7 "$requested_at"; then
+    if ! touch "$HANDOFF_PATH"; then
+      fail "cannot update the handoff document's mtime: ${HANDOFF_PATH}"
+      return 1
+    fi
+  fi
 
   # Writes only **what the request side actually knows**. The marker can carry one more field,
   # `launch_attempt` (the successor the watcher started on that attempt), but that's **a field
@@ -711,6 +762,35 @@ st_setup_case() {
   # meant to pass default to it running. Only the cases that measure the not-running shape opt
   # out, with rein_st_stop_fake_watcher.
   rein_st_start_fake_watcher "$ST_RUNTIME" "$ST_CWD"
+}
+
+# Builds one child's own record with a chosen last line. The ledger entry alone cannot say
+# whether a child was stopped from outside -- that judgment reads this file's **last** line -- so
+# every case that needs a stopped or a still-running child builds the record through here. A
+# line is always written ahead of the interesting one, so "the last line" is a real position and
+# not just "the only line".
+st_write_child_record() {
+  local path="$1" last="$2"
+  mkdir -p "${path%/*}"
+  printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}' >"$path"
+  [ -n "$last" ] || return 0
+  printf '%s\n' "$last" >>"$path"
+}
+
+# Puts a file's mtime at a chosen epoch. A literal `touch -t` stamp cannot be written out for a
+# case whose point is "one second outside the window that config declares" -- the stamp has to be
+# computed from the same number the judgment uses, or the case stops sitting on the boundary the
+# moment that number changes.
+# **The stamp is formatted in local time on purpose.** `touch -t` reads its argument as local
+# time, so formatting the epoch as UTC lands the mtime a whole timezone offset away from the one
+# asked for -- which is exactly how a boundary case ends up passing without testing its boundary
+# (observed here: a future-dated document came out 9 hours less future than intended and the
+# case went green under a mutation that should have reddened it).
+st_set_mtime() {
+  local path="$1" epoch="$2" stamp
+  stamp="$(date -r "$epoch" +%Y%m%d%H%M.%S 2>/dev/null)"
+  [ -n "$stamp" ] || return 1
+  touch -t "$stamp" "$path"
 }
 
 # The default entry point suppresses GUI notifications (a case that goes through it doesn't
@@ -1158,86 +1238,6 @@ selftest() {
   st_reject_case "a session_id with a glob metacharacter still finds its own children" 1 \
     "still has 1 running child agent"
 
-  # The accepting side: exactly one marker matching the contract gets placed.
-  case_dir="$tmp/happy"
-  st_setup_case "$case_dir"
-  touch -t 202001010000 "$ST_HANDOFF"
-  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
-    --session-id "sess-1" --handoff "$ST_HANDOFF" \
-    --successor-name "next-one" --note "12% context usage"
-  if st_expect_status "the marker gets written and this ends with 0" 0; then
-    if [ ! -f "$ST_MARKER" ]; then
-      st_fail "a marker gets placed" "${ST_MARKER} is missing: ${ST_OUT}"
-    else
-      st_ok
-    fi
-  fi
-
-  if [ -f "$ST_MARKER" ]; then
-    for field in \
-      "schema=$REIN_MARKER_SCHEMA" \
-      "session_id=sess-1" \
-      "handoff_path=$ST_HANDOFF" \
-      "cwd=$ST_CWD" \
-      "successor_name=next-one" \
-      "note=12% context usage"; do
-      if [ "$(jq -r ".${field%%=*} // empty" "$ST_MARKER")" = "${field#*=}" ]; then
-        st_ok
-      else
-        st_fail "the marker's ${field%%=*}" "expected ${field#*=} / actual $(jq -r ".${field%%=*} // empty" "$ST_MARKER")"
-      fi
-    done
-
-    # requested_at must be a format that passes the watcher's R4 (case-prefixed, round-tripped).
-    epoch_requested="$(rein_iso_to_epoch "$(jq -r '.requested_at' "$ST_MARKER")")"
-    if [ -n "$epoch_requested" ]; then
-      st_ok
-    else
-      st_fail "requested_at passes R4" "cannot be parsed: $(jq -r '.requested_at' "$ST_MARKER")"
-    fi
-
-    # R7's ordering guarantee: since the document is touched right before writing, even a 2020
-    # mtime falls inside the window.
-    mtime="$(rein_mtime "$ST_HANDOFF")"
-    if [ -n "$epoch_requested" ] && [ -n "$mtime" ] &&
-      [ "$mtime" -le "$((epoch_requested + 60))" ] && [ "$mtime" -ge "$((epoch_requested - 60))" ]; then
-      st_ok
-    else
-      st_fail "touches the document right before writing" "mtime=${mtime} requested_at_epoch=${epoch_requested}"
-    fi
-
-    # Checks all the way through atomic write's cleanup (a temp file in the same directory + mv).
-    if [ -z "$(find "$ST_RUNTIME" -name "${REIN_MARKER_BASENAME}.*" -print -quit 2>/dev/null)" ]; then
-      st_ok
-    else
-      st_fail "leaves no temp file behind" "$(find "$ST_RUNTIME" -name "${REIN_MARKER_BASENAME}.*")"
-    fi
-  fi
-
-  # A relative-path document is resolved to an absolute path before being written (the
-  # contract requires an absolute path -- R6).
-  case_dir="$tmp/relative"
-  st_setup_case "$case_dir"
-  ST_OUT="$( (cd "$ST_CWD" && env "${ST_ENV_ARGS[@]}" "$REIN_ST_BASH" "$SCRIPT_PATH" \
-    --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
-    --session-id "sess-rel" --handoff "handoff.md" 2>&1 </dev/null) )"
-  ST_STATUS=$?
-  if st_expect_status "accepts a relative-path document" 0; then
-    if [ "$(jq -r '.handoff_path' "$ST_MARKER" 2>/dev/null)" = "$ST_HANDOFF" ]; then
-      st_ok
-    else
-      st_fail "resolves a relative path to absolute" "$(jq -r '.handoff_path' "$ST_MARKER" 2>/dev/null)"
-    fi
-  fi
-
-  # An optional field's key doesn't appear at all when omitted (an unset value is never
-  # recorded as an empty string).
-  case_dir="$tmp/minimal"
-  st_setup_case "$case_dir"
-  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" --session-id "sess-2" --handoff "$ST_HANDOFF"
-  if st_expect_status "writes fine with no optional fields" 0; then
-    if [ "$(jq -r 'has("successor_name"), has("note")' "$ST_MARKER" | tr '\n' ' ')" = "false false " ]; then
-      st_ok
   # (g) A child stopped from outside. No SubagentStop is delivered, so its ledger entry stays
   #     and its record is still well inside the cutoff -- the cutoff alone reads it as running,
   #     which refused every handover for the whole 900 seconds after a deliberate stop (observed
@@ -1367,6 +1367,171 @@ selftest() {
   # something: a review that keys off the document's mtime reads bytes that never changed as
   # newly edited and demands another full pass over it (measured -- a request, then the same
   # request re-issued after a cancellation, cost two passes over an unchanged document).
+  # (a) Already inside the window: the mtime does not move, and the marker still corresponds to
+  #     the document (requested_at is at or after it, which is R7's ordering).
+  case_dir="$tmp/handoff-mtime-fresh"
+  st_setup_case "$case_dir"
+  st_handoff_mtime="$(rein_mtime "$ST_HANDOFF")"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-fresh-doc" --handoff "$ST_HANDOFF"
+  if st_expect_status "a request on an already-current document goes through" 0; then
+    if [ "$(rein_mtime "$ST_HANDOFF")" = "$st_handoff_mtime" ]; then
+      st_ok
+    else
+      st_fail "leaves an already-current document's mtime alone" \
+        "before=${st_handoff_mtime} after=$(rein_mtime "$ST_HANDOFF")"
+    fi
+    epoch_requested="$(rein_iso_to_epoch "$(jq -r '.requested_at // empty' "$ST_MARKER" 2>/dev/null)")"
+    if [ -n "$epoch_requested" ] && [ "$epoch_requested" -ge "$st_handoff_mtime" ]; then
+      st_ok
+    else
+      st_fail "the marker still comes after the untouched document" \
+        "mtime=${st_handoff_mtime} requested_at_epoch=${epoch_requested}"
+    fi
+  fi
+  # (b) The reason this matters: re-issuing the request (what a cancelled handover forces) must
+  #     not move the mtime either. This is the second pass that used to be unavoidable.
+  rm -f "$ST_MARKER"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-fresh-doc" --handoff "$ST_HANDOFF"
+  if st_expect_status "the request can be re-issued on the same document" 0; then
+    if [ "$(rein_mtime "$ST_HANDOFF")" = "$st_handoff_mtime" ]; then
+      st_ok
+    else
+      st_fail "a re-issued request leaves the mtime alone too" \
+        "before=${st_handoff_mtime} after=$(rein_mtime "$ST_HANDOFF")"
+    fi
+  fi
+  # (c) The neighbouring case on the stale side: one second past the window's lower bound, the
+  #     touch has to fire, or the watcher would reject the marker on R7. The window comes from
+  #     the same config key the watcher reads, never a number written out here.
+  case_dir="$tmp/handoff-mtime-stale"
+  st_setup_case "$case_dir"
+  st_window=""
+  if rein_config_lookup handoff_fresh_window_sec; then
+    st_window="$REIN_CFG_KEY_DEFAULT"
+  fi
+  case "$st_window" in
+    '' | *[!0-9]*)
+      st_fail "reads the freshness window from the config table" "got: ${st_window}"
+      st_window=600
+      ;;
+    *) st_ok ;;
+  esac
+  st_handoff_mtime="$(($(rein_now_epoch) - st_window - 1))"
+  st_set_mtime "$ST_HANDOFF" "$st_handoff_mtime"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-stale-doc" --handoff "$ST_HANDOFF"
+  if st_expect_status "a request on a stale document goes through" 0; then
+    if [ "$(rein_mtime "$ST_HANDOFF")" -gt "$st_handoff_mtime" ]; then
+      st_ok
+    else
+      st_fail "touches a document that is outside the window" \
+        "before=${st_handoff_mtime} after=$(rein_mtime "$ST_HANDOFF")"
+    fi
+  fi
+  # (d) The other side of the window. A document whose mtime is in the future fails R7's upper
+  #     bound, so it gets touched too -- treating "not older than the lower bound" as the whole
+  #     test would leave a future-dated document untouched and the marker rejected.
+  case_dir="$tmp/handoff-mtime-future"
+  st_setup_case "$case_dir"
+  st_handoff_mtime="$(($(rein_now_epoch) + 86400))"
+  st_set_mtime "$ST_HANDOFF" "$st_handoff_mtime"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-future-doc" --handoff "$ST_HANDOFF"
+  if st_expect_status "a request on a future-dated document goes through" 0; then
+    # Pinned to "no longer in the future", not merely "smaller than it was" -- a touch that
+    # landed anywhere earlier than a day ahead would satisfy the weaker form while still leaving
+    # the marker on the wrong side of R7's upper bound.
+    if [ "$(rein_mtime "$ST_HANDOFF")" -le "$(rein_now_epoch)" ]; then
+      st_ok
+    else
+      st_fail "pulls a future-dated document back to now" \
+        "before=${st_handoff_mtime} after=$(rein_mtime "$ST_HANDOFF") now=$(rein_now_epoch)"
+    fi
+  fi
+
+  # The accepting side: exactly one marker matching the contract gets placed.
+  case_dir="$tmp/happy"
+  st_setup_case "$case_dir"
+  touch -t 202001010000 "$ST_HANDOFF"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-1" --handoff "$ST_HANDOFF" \
+    --successor-name "next-one" --note "12% context usage"
+  if st_expect_status "the marker gets written and this ends with 0" 0; then
+    if [ ! -f "$ST_MARKER" ]; then
+      st_fail "a marker gets placed" "${ST_MARKER} is missing: ${ST_OUT}"
+    else
+      st_ok
+    fi
+  fi
+
+  if [ -f "$ST_MARKER" ]; then
+    for field in \
+      "schema=$REIN_MARKER_SCHEMA" \
+      "session_id=sess-1" \
+      "handoff_path=$ST_HANDOFF" \
+      "cwd=$ST_CWD" \
+      "successor_name=next-one" \
+      "note=12% context usage"; do
+      if [ "$(jq -r ".${field%%=*} // empty" "$ST_MARKER")" = "${field#*=}" ]; then
+        st_ok
+      else
+        st_fail "the marker's ${field%%=*}" "expected ${field#*=} / actual $(jq -r ".${field%%=*} // empty" "$ST_MARKER")"
+      fi
+    done
+
+    # requested_at must be a format that passes the watcher's R4 (case-prefixed, round-tripped).
+    epoch_requested="$(rein_iso_to_epoch "$(jq -r '.requested_at' "$ST_MARKER")")"
+    if [ -n "$epoch_requested" ]; then
+      st_ok
+    else
+      st_fail "requested_at passes R4" "cannot be parsed: $(jq -r '.requested_at' "$ST_MARKER")"
+    fi
+
+    # R7's ordering guarantee. This document was set to a 2020 mtime, so it is outside the
+    # window and the touch does fire -- pulling even a 2020 mtime inside it. (The other branch,
+    # a document already inside the window keeping its mtime, is the `handoff-mtime-*` cases.)
+    mtime="$(rein_mtime "$ST_HANDOFF")"
+    if [ -n "$epoch_requested" ] && [ -n "$mtime" ] &&
+      [ "$mtime" -le "$((epoch_requested + 60))" ] && [ "$mtime" -ge "$((epoch_requested - 60))" ]; then
+      st_ok
+    else
+      st_fail "touches the document right before writing" "mtime=${mtime} requested_at_epoch=${epoch_requested}"
+    fi
+
+    # Checks all the way through atomic write's cleanup (a temp file in the same directory + mv).
+    if [ -z "$(find "$ST_RUNTIME" -name "${REIN_MARKER_BASENAME}.*" -print -quit 2>/dev/null)" ]; then
+      st_ok
+    else
+      st_fail "leaves no temp file behind" "$(find "$ST_RUNTIME" -name "${REIN_MARKER_BASENAME}.*")"
+    fi
+  fi
+
+  # A relative-path document is resolved to an absolute path before being written (the
+  # contract requires an absolute path -- R6).
+  case_dir="$tmp/relative"
+  st_setup_case "$case_dir"
+  ST_OUT="$( (cd "$ST_CWD" && env "${ST_ENV_ARGS[@]}" "$REIN_ST_BASH" "$SCRIPT_PATH" \
+    --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" \
+    --session-id "sess-rel" --handoff "handoff.md" 2>&1 </dev/null) )"
+  ST_STATUS=$?
+  if st_expect_status "accepts a relative-path document" 0; then
+    if [ "$(jq -r '.handoff_path' "$ST_MARKER" 2>/dev/null)" = "$ST_HANDOFF" ]; then
+      st_ok
+    else
+      st_fail "resolves a relative path to absolute" "$(jq -r '.handoff_path' "$ST_MARKER" 2>/dev/null)"
+    fi
+  fi
+
+  # An optional field's key doesn't appear at all when omitted (an unset value is never
+  # recorded as an empty string).
+  case_dir="$tmp/minimal"
+  st_setup_case "$case_dir"
+  st_run_request --cwd "$ST_CWD" --runtime-dir "$ST_RUNTIME" --session-id "sess-2" --handoff "$ST_HANDOFF"
+  if st_expect_status "writes fine with no optional fields" 0; then
+    if [ "$(jq -r 'has("successor_name"), has("note")' "$ST_MARKER" | tr '\n' ' ')" = "false false " ]; then
+      st_ok
     else
       st_fail "omits an omitted optional field entirely" "$(cat "$ST_MARKER")"
     fi
