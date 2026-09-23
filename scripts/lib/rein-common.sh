@@ -378,15 +378,27 @@ REIN_SEAT_EVENT_SEATED="seated"
 # The seat log's event name for "the pointer moved on, but attach still has not returned." The
 # watchdog is the writer; an audit after the fact is the reader.
 REIN_SEAT_EVENT_HANDOVER_STALLED="handover_stalled"
-# The one sentence that says how to get out of that state. The mechanism is contractually
-# forbidden from touching the terminal or the attach connection (no active detach), so **the only
-# thing that returns attach is the user leaving the screen they are looking at** -- which makes
-# this the single actionable instruction, and the reason it is held in one place: both surfaces
-# that report the mismatch (the watchdog's notification and `rein status`'s seat line) have to say
-# the same thing, or one of them sends the user somewhere else. No keystroke is named, because
-# which key leaves that screen belongs to the external CLI and is not something this side can
-# confirm.
-REIN_SEAT_DETACH_HINT="leave the agent list screen and the seat reconnects to the successor on its own"
+# The sentences that say how to get out of that state. The mechanism is contractually forbidden
+# from touching the terminal or the attach connection (no active detach), so **the only thing that
+# returns attach is the user closing the agent list** that ← on an empty prompt turns attach into
+# -- which makes this the single actionable instruction, and the reason it is held in one place:
+# every surface that reports the mismatch (the watchdog's notification, its seat log line, and
+# `rein status`'s seat line) has to say the same thing, or one of them sends the user somewhere
+# else. The keys were measured on the real CLI: Esc twice, or Ctrl+C twice in quick succession,
+# ends the list (a single press only arms the exit), while `q` is typed into the list's prompt
+# instead of closing it. The keys only close the list when the list itself has them: a session
+# opened from the list takes Esc for itself, so both wordings say to go back to the list with ←
+# first.
+# There are two wordings because only one surface can know that the terminal has become the list.
+# The definite one is for a watchdog that has confirmed the attach process is now `claude agents`;
+# it still says only that the terminal has become the agent list, never which screen of it is
+# showing, because the argv stays `claude agents` whether the list's overview or a session opened
+# from it (the predecessor or any other) is on screen, and nothing outside the process tells them
+# apart. The conditional one is for everything else -- a watchdog that could not confirm it, and
+# `rein status`, which never inspects the process -- so neither ever tells the user they are
+# somewhere they may not be.
+REIN_SEAT_AGENT_LIST_HINT="press Esc twice (or Ctrl+C twice) on the agent list itself -- first press the left arrow key if a session is open in it -- and the seat reconnects to the successor on its own; this seat's terminal has become the agent list (the left arrow key was pressed in the session), so it cannot follow the handover by itself"
+REIN_SEAT_DETACH_HINT="if the seat's terminal has become the agent list, press Esc twice (or Ctrl+C twice) on the list itself -- first press the left arrow key if a session is open in it -- and the seat reconnects to the successor on its own"
 
 # The floor and the ceiling (seconds) on how far apart the stall notification repeats.
 # **The firing threshold is not a spacing.** The threshold's job is to avoid a false alarm, so it

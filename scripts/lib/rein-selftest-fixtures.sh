@@ -636,6 +636,26 @@ EOF
   chmod +x "$bin_dir/ps"
 }
 
+# A `ps` that answers everything except a lone `-o command=` (one process's argv), which it
+# refuses. Plays out "ps won't give the argv" while the start-time and
+# liveness queries the seat also depends on keep working, so the case measures just that one
+# missing answer rather than a seat that can't start.
+rein_st_write_ps_without_argv() {
+  local bin_dir="$1"
+  mkdir -p "$bin_dir"
+  cat >"$bin_dir/ps" <<'EOF'
+#!/usr/bin/env bash
+for fake_ps_arg in "$@"; do
+  if [ "$fake_ps_arg" = "command=" ]; then
+    printf 'ps: argv unavailable (fixture)\n' >&2
+    exit 1
+  fi
+done
+exec /bin/ps "$@"
+EOF
+  chmod +x "$bin_dir/ps"
+}
+
 # PATH with every directory that could resolve the given command removed. **Lives in this file
 # because both the hook runner (scripts/rein-hook.sh) and the CLI
 # (scripts/lib/cli/selftest/) use it** (the canonical reason is at the top of this file).
@@ -1004,6 +1024,16 @@ case "$sub" in
       prev="$a"
     done
     fake_require_job_handle "$target"
+    # Plays out ← on an empty prompt: the real attach replaces itself with `claude agents` in the
+    # same process (same pid, same start time, argv now `claude agents` -- measured) and never
+    # returns on a stop. A shebang script can't show that argv (the kernel puts the interpreter
+    # first), so this execs the bash binary itself with argv[0] set to `claude` and a script
+    # literally named `agents` as argv[1]. That script moves the pointer (the handover happens
+    # while the list is open) and holds the process for FAKE_ATTACH_SLEEP_SEC.
+    if [ "${FAKE_ATTACH_AGENT_LIST:-0}" = "1" ]; then
+      cd "${0%/*}/agent-list" || exit 1
+      exec -a claude "$BASH" agents
+    fi
     if [ -n "${FAKE_ATTACH_CP_SRC:-}" ] && [ -n "${FAKE_ATTACH_CP_DST:-}" ]; then
       # Places it with a single rename (never opens a window where a reader sees a partial write).
       cp "$FAKE_ATTACH_CP_SRC" "${FAKE_ATTACH_CP_DST}.fake-partial" &&
@@ -1021,6 +1051,24 @@ esac
 exit 0
 EOF
   chmod +x "$bin_dir/claude"
+
+  # The agent list the fake attach turns into (run by bash as `claude agents`, see above). It
+  # records entering and leaving, and any signal that reaches it, in FAKE_LOG.agent-list -- a
+  # leave line after the whole hold with no signal line is what shows nothing touched it.
+  # FAKE_AGENT_LIST_MOVE_AFTER_SEC is how long the list is open before the pointer moves.
+  mkdir -p "$bin_dir/agent-list"
+  cat >"$bin_dir/agent-list/agents" <<'EOF'
+trap 'printf "signalled\n" >>"$FAKE_LOG.agent-list"' HUP INT TERM
+printf 'entered\n' >>"$FAKE_LOG.agent-list"
+if [ -n "${FAKE_ATTACH_CP_SRC:-}" ] && [ -n "${FAKE_ATTACH_CP_DST:-}" ]; then
+  sleep "${FAKE_AGENT_LIST_MOVE_AFTER_SEC:-1}"
+  cp "$FAKE_ATTACH_CP_SRC" "${FAKE_ATTACH_CP_DST}.fake-partial" &&
+    mv "${FAKE_ATTACH_CP_DST}.fake-partial" "$FAKE_ATTACH_CP_DST"
+fi
+sleep "${FAKE_ATTACH_SLEEP_SEC:-0}"
+printf 'left\n' >>"$FAKE_LOG.agent-list"
+exit 0
+EOF
 
   cat >"$bin_dir/osascript" <<'EOF'
 #!/usr/bin/env bash

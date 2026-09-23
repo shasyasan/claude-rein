@@ -403,7 +403,8 @@ wait_for_pointer_change() {
 }
 
 seat_cleanup() {
-  [ -n "$WATCHDOG_SENTINEL" ] && rm -f "$WATCHDOG_SENTINEL" "${WATCHDOG_SENTINEL}.log"
+  [ -n "$WATCHDOG_SENTINEL" ] && rm -f "$WATCHDOG_SENTINEL" "${WATCHDOG_SENTINEL}.log" \
+    "${WATCHDOG_SENTINEL}.attach" "${WATCHDOG_SENTINEL}.attach.partial"
   release_seat_lock
   rein_close_error_sink
 }
@@ -643,6 +644,48 @@ seat_watchdog_parent_present() {
   return 0
 }
 
+# Runs inside the attach subshell, right before it replaces itself with `claude attach`, and
+# leaves that process's pid and start time where the watchdog can read them. The watchdog is
+# forked before attach, so it has no other way to learn which process attach is, and bash 3.2 has
+# no BASHPID to ask the subshell's own pid directly -- a child's PPID is the subshell's pid, which
+# the `exec` that follows keeps for `claude attach` (and for the `claude agents` that ← turns it
+# into, which is the whole point of recording it).
+# The identity is taken here, while the pid is certainly this process, rather than by the watchdog
+# on first sight -- a reader that took it later could record whatever holds the pid by then.
+# Published by a rename, so the watchdog never reads half of it.
+# A failure only means the watchdog never learns the process, which falls back to the threshold
+# -- the caller never lets it hold attach up.
+record_attach_identity() {
+  local dest="$1" pid
+  sh -c 'printf "%s\n" "$PPID"' >"${dest}.partial" || return 1
+  IFS= read -r pid <"${dest}.partial" || return 1
+  printf '%s\n%s\n' "$pid" "$(rein_process_start_identity "$pid")" >"${dest}.partial" || return 1
+  mv -f "${dest}.partial" "$dest"
+}
+
+# Whether the attach process is **confirmed** to have become the agent list. Pressing ← on an
+# empty prompt makes `claude attach` replace itself with `claude agents` (same pid, same start
+# time, only the argv changes -- measured), and from then on no stop of any session returns it.
+# Confirmation needs both halves: the start time recorded before attach began still matches (the
+# pid has not been handed to a different process), and the argv's second word is `agents`. The
+# start time is compared after the argv is read, so a match proves the argv came from that same
+# process. Anything that can't be confirmed -- no record, `ps` not giving the argv, a different
+# process on the pid, an argv[0] whose path contains whitespace -- answers "not confirmed," which
+# leaves the threshold in charge; it never guesses toward the list.
+# 0=confirmed on the agent list / 1=not confirmed
+seat_attach_on_agent_list() {
+  local pid="$1" recorded="$2" argv second
+  case "$pid" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  [ -n "$recorded" ] || return 1
+  argv="$(rein_ps_command "$pid")"
+  [ -n "$argv" ] || return 1
+  [ "$(rein_process_start_identity "$pid")" = "$recorded" ] || return 1
+  read -r _ second _ <<<"$argv"
+  [ "$second" = "agents" ]
+}
+
 # A seat mid-attach has its terminal occupied and can't judge anything itself, so a child process
 # watches the current pointer instead. It **only notifies** -- it never touches the terminal or
 # attach (no active detach; the mechanism never seizes a seat the user is actively working in). It
@@ -671,9 +714,20 @@ seat_watchdog_parent_present() {
 # already refuses to act on it, so the notification is the only thing left. Whether someone
 # staying on an old session on purpose needs a way to quiet it is a question for the user, not
 # something to decide by adding a key here.
+#
+# **The threshold is skipped only for an attach process confirmed to have become the agent list**
+# (seat_attach_on_agent_list). The threshold exists to wait out a handover that may still be in
+# progress, and a process that has become `claude agents` is not waiting on one -- stopping the
+# predecessor only drops the list back to its overview, and it never returns. So once that is
+# confirmed, the first round that sees the pointer differ fires, with the definite wording.
+# Everything unconfirmed keeps the threshold and the conditional wording. The confirmation is
+# re-read on every out-of-step round, because ← can be pressed at any moment during attach.
+# Only a pointer that differs ever fires: a user who opens the list while the pointer still
+# matches is where they chose to be, and nothing about it is wrong.
 run_attach_watchdog() {
   local attached_id="$1" sentinel="$2" parent_pid="$3" parent_start="$4" limit="$5" repeat="$6"
-  local changed_at=0 notified_at=0 current reason now elapsed
+  local attach_record="$7"
+  local changed_at=0 notified_at=0 current reason now elapsed on_list attach_pid="" attach_start=""
   while :; do
     sleep "$POLL_INTERVAL_SEC"
     [ -e "$sentinel" ] || return 0
@@ -687,12 +741,22 @@ run_attach_watchdog() {
       continue
     fi
     now="$(rein_now_monotonic)"
+    if [ -z "$attach_pid" ] && [ -f "$attach_record" ]; then
+      if ! { IFS= read -r attach_pid && IFS= read -r attach_start; } <"$attach_record"; then
+        attach_pid=""
+        attach_start=""
+      fi
+    fi
+    on_list=0
+    if seat_attach_on_agent_list "$attach_pid" "$attach_start"; then
+      on_list=1
+    fi
     if [ "$changed_at" -eq 0 ]; then
       changed_at="$now"
-      continue
+      [ "$on_list" -eq 1 ] || continue
     fi
     elapsed="$((now - changed_at))"
-    if [ "$elapsed" -le "$limit" ]; then
+    if [ "$on_list" -eq 0 ] && [ "$elapsed" -le "$limit" ]; then
       continue
     fi
     if [ "$notified_at" -ne 0 ] && [ "$((now - notified_at))" -lt "$repeat" ]; then
@@ -701,8 +765,13 @@ run_attach_watchdog() {
     notified_at="$now"
     # The instruction comes first: on a notification the tail can be cut off, and what the user
     # needs is the one action that ends the state, not the arithmetic behind it.
-    printf -v reason 'attach has not returned -- %s. The pointer moved to %s %s seconds ago while this seat is still connected to %s (this only notifies: it never touches your terminal or the connection). It repeats every %s seconds until the two line up.' \
-      "$REIN_SEAT_DETACH_HINT" "$current" "$elapsed" "$attached_id" "$repeat"
+    if [ "$on_list" -eq 1 ]; then
+      printf -v reason '%s. The pointer moved to %s %s seconds ago while this seat is still connected to %s (this only notifies: it never touches your terminal or the connection). It repeats every %s seconds until the two line up.' \
+        "$REIN_SEAT_AGENT_LIST_HINT" "$current" "$elapsed" "$attached_id" "$repeat"
+    else
+      printf -v reason 'attach has not returned -- %s. The pointer moved to %s %s seconds ago while this seat is still connected to %s (this only notifies: it never touches your terminal or the connection). It repeats every %s seconds until the two line up.' \
+        "$REIN_SEAT_DETACH_HINT" "$current" "$elapsed" "$attached_id" "$repeat"
+    fi
     seat_log "$REIN_SEAT_EVENT_HANDOVER_STALLED" "$reason" "$attached_id"
     rein_notify "rein: the handover is not being followed" "$reason"
   done
@@ -880,13 +949,15 @@ run_seat() {
     # there" from "something else now holds that pid."
     watchdog_parent_start="$(rein_process_start_identity "$$")"
     run_attach_watchdog "$session_id" "$WATCHDOG_SENTINEL" "$$" "$watchdog_parent_start" \
-      "$(watchdog_limit_sec)" "$(watchdog_repeat_sec)" \
+      "$(watchdog_limit_sec)" "$(watchdog_repeat_sec)" "${WATCHDOG_SENTINEL}.attach" \
       >>"${WATCHDOG_SENTINEL}.log" 2>&1 & # record-append-exempt: the destination sits next to this run's own mktemp temp file (not the lineage's records location), not somewhere a clone can bundle in
     WATCHDOG_PID=$!
     # attach alone is never wrapped in a cap (never returning while the user is sitting there is the
     # normal state, and cutting it off on a timer would take the seat out from under them mid-work).
     # Caps only apply to the unattended enumeration, launch, and stop calls.
-    (cd "$TARGET_CWD" && claude attach "$attach_handle") # run-limit-exempt: attach normally never returns while the user is sitting there, and cutting it off on a timer would take the seat out from under them mid-work (caps only apply to the unattended enumeration, launch, and stop calls)
+    # The subshell records its own pid and start time for the watchdog and then `exec`s attach, so
+    # that pid is attach's (and stays the agent list's after ←). Recording never holds attach up.
+    (cd "$TARGET_CWD" && { record_attach_identity "${WATCHDOG_SENTINEL}.attach" || :; } && exec claude attach "$attach_handle") # run-limit-exempt: attach normally never returns while the user is sitting there, and cutting it off on a timer would take the seat out from under them mid-work (caps only apply to the unattended enumeration, launch, and stop calls)
     attach_rc=$?
     rm -f "$WATCHDOG_SENTINEL"
     # The watchdog ends on its own once its sentinel disappears (within one poll). This waits for
@@ -900,7 +971,7 @@ run_seat() {
     if [ -s "${WATCHDOG_SENTINEL}.log" ]; then
       cat "${WATCHDOG_SENTINEL}.log" >&2
     fi
-    rm -f "${WATCHDOG_SENTINEL}.log"
+    rm -f "${WATCHDOG_SENTINEL}.log" "${WATCHDOG_SENTINEL}.attach" "${WATCHDOG_SENTINEL}.attach.partial"
     WATCHDOG_SENTINEL=""
     # **The closing half of the pair.** Written here, before any of the branches below can return,
     # so that every way out of an attach leaves the same mark: from this line until the next
@@ -1014,6 +1085,7 @@ rein_st_section_table() {
   cat <<'EOF'
 proc:safe st_section_safe
 proc:seat st_section_seat
+proc:agent-list st_section_agent_list
 EOF
 }
 
@@ -1100,6 +1172,8 @@ st_seat_env_args() {
     "FAKE_ATTACH_CP_DST=${ST_ATTACH_CP_DST:-}"
     "FAKE_ATTACH_EXIT=${ST_ATTACH_EXIT:-0}"
     "FAKE_ATTACH_SLEEP_SEC=${ST_ATTACH_SLEEP:-}"
+    "FAKE_ATTACH_AGENT_LIST=${ST_ATTACH_AGENT_LIST:-0}"
+    "FAKE_AGENT_LIST_MOVE_AFTER_SEC=${ST_AGENT_LIST_MOVE_AFTER:-1}"
     "FAKE_AGENTS_FAIL=${ST_AGENTS_FAIL:-0}"
     "FAKE_AGENTS_FAIL_ONCE_AT=${ST_AGENTS_FAIL_ONCE_AT:-}"
     # Length of one round. The default is 0.2 seconds to keep selftest fast, but cases that
@@ -1262,6 +1336,62 @@ st_expect_notify() {
       ;;
   esac
   return 0
+}
+
+# Whether the latest notification is the stall notification and its body **starts** with the
+# given text. "Contains" is not enough for the instruction: it is put first because a
+# notification can be cut off at the tail, so where it sits is part of the contract.
+st_expect_notify_leads_with() {
+  local name="$1" prefix="$2" count got_title got_message
+  if [ -z "$prefix" ]; then
+    st_fail "${name}" "the expected prefix is empty (a broken test: it would pass without ever looking at the output)"
+    return 1
+  fi
+  count="$(rein_st_calls_total "$ST_NOTIFY")"
+  if [ "$count" -eq 0 ]; then
+    st_fail "${name}" "no notification fired"
+    return 1
+  fi
+  got_title="$(rein_st_notify_field "$ST_NOTIFY" "$count" title)"
+  got_message="$(rein_st_notify_field "$ST_NOTIFY" "$count" message)"
+  if [ "$got_title" != "rein: the handover is not being followed" ]; then
+    st_fail "${name}" "the latest notification is not the stall notification: ${got_title}"
+    return 1
+  fi
+  case "$got_message" in
+    "$prefix"*) ;;
+    *)
+      st_fail "${name}" "the body does not start with ${prefix}: ${got_message}"
+      return 1
+      ;;
+  esac
+  st_ok
+  return 0
+}
+
+# No notification claims the terminal has become the agent list. The fragment is a literal so the
+# check can't be emptied along with the constant it guards.
+st_expect_notify_lacks_definite() {
+  local name="$1" count
+  count="$(st_count_notify "this seat's terminal has become the agent list")"
+  if [ "$count" -eq 0 ]; then
+    st_ok
+    return 0
+  fi
+  st_fail "${name}" "${count} notifications claimed the agent list: $(cat "$ST_NOTIFY")"
+  return 1
+}
+
+# The seconds the latest notification says have passed since the pointer moved (empty when
+# there is none). Lets a case tell "fired after the threshold" from "fired before it" out of the
+# notification itself rather than from wall-clock guesses around the whole run.
+st_latest_notify_elapsed() {
+  local count message
+  count="$(rein_st_calls_total "$ST_NOTIFY")"
+  [ "$count" -gt 0 ] || return 0
+  message="$(rein_st_notify_field "$ST_NOTIFY" "$count" message)"
+  message="${message#*The pointer moved to * }"
+  printf '%s\n' "${message%% seconds ago*}"
 }
 
 # Counts the notifications whose body contains the given text. Used for checks that care not
@@ -2040,6 +2170,12 @@ st_section_seat() {
     fi
     st_expect_seat_log_line "the record carries the way out too" handover_stalled \
       "$REIN_SEAT_DETACH_HINT"
+    # The attach process here is still `claude attach`, so nothing confirms the agent list: the
+    # instruction stays conditional and never claims where the terminal is. Pinned as literals,
+    # because a check that read the constant would stay green however the constant was gutted.
+    st_expect_notify_leads_with "an unconfirmed stall opens with the conditional instruction" \
+      "attach has not returned -- if the seat's terminal has become the agent list, press Esc twice (or Ctrl+C twice) on the list itself -- first press the left arrow key if a session is open in it -- and the seat reconnects to the successor on its own. The pointer moved to seat-2 "
+    st_expect_notify_lacks_definite "and never claims the terminal has become the agent list"
   fi
 
   # It doesn't go silent after the first one. Firing once and returning (what it used to do) made
@@ -3232,6 +3368,281 @@ st_section_seat() {
     esac
   fi
 
+}
+
+# Whether the agent list's process shows the agent list's lines in FAKE_LOG.agent-list: it was
+# entered, it left on its own after the whole hold, and no signal reached it in between.
+st_expect_agent_list_untouched() {
+  local name="$1" got
+  got="$(cat "$ST_LOG.agent-list" 2>/dev/null)"
+  if [ "$got" = "$(printf 'entered\nleft')" ]; then
+    st_ok
+    return 0
+  fi
+  st_fail "${name}" "the agent list's own record is not a plain enter and leave: ${got}"
+  return 1
+}
+
+# ← on an empty prompt turns attach into the agent list (`claude agents`, same pid and start time)
+# and from then on no stop returns it. The watchdog confirms that from the process itself and, only
+# then, skips the threshold and says so outright; everything it can't confirm keeps the threshold
+# and the conditional wording. The real-time cases run the seat against the fake CLI's agent list
+# (fixtures: FAKE_ATTACH_AGENT_LIST).
+st_section_agent_list() {
+  local list_pid list_start sentinel wd_pid count elapsed shim_dir i attach_pid
+  local definite_prefix conditional_prefix
+  definite_prefix="press Esc twice (or Ctrl+C twice) on the agent list itself -- first press the left arrow key if a session is open in it -- and the seat reconnects to the successor on its own; this seat's terminal has become the agent list (the left arrow key was pressed in the session), so it cannot follow the handover by itself. The pointer moved to seat-2 "
+  conditional_prefix="attach has not returned -- if the seat's terminal has become the agent list, press Esc twice (or Ctrl+C twice) on the list itself -- first press the left arrow key if a session is open in it -- and the seat reconnects to the successor on its own. The pointer moved to seat-2 "
+
+  # The confirmed case under the default config, whose threshold is 681 seconds (pinned by
+  # st_expect_watchdog_limit): the handover happens a second after the list opened, and the
+  # notification has to come inside a five-second hold -- far ahead of the threshold -- opening
+  # with the definite instruction. The attach process is never signalled and never replaced.
+  # The poll is two seconds here because the elapsed time is counted in whole seconds: at the
+  # usual 0.2-second poll, a watchdog that let the first out-of-step round pass would fire one
+  # round later still reading 0 or 1, so only a round wider than the one-second allowance tells
+  # the first round from the second.
+  case_dir="$tmp/agent-list-fires-early"
+  st_setup_case "$case_dir"
+  rein_st_write_agents "$ST_AGENTS" "$ST_CWD" "seat-1" "seat-2"
+  rein_st_write_pointer "$ST_POINTER" "seat-1" "predecessor" "$ST_CWD" 1
+  rein_st_write_pointer "$ST_CWD/next-pointer.json" "seat-2" "successor" "$ST_CWD" 2
+  ST_ATTACH_CP_SRC="$ST_CWD/next-pointer.json"
+  ST_ATTACH_CP_DST="$ST_POINTER"
+  ST_ATTACH_AGENT_LIST=1
+  ST_AGENT_LIST_MOVE_AFTER=1
+  ST_ATTACH_SLEEP=5
+  ST_POLL_INTERVAL=2
+  ST_MAX_ATTACH=1
+  st_run_seat
+  unset ST_ATTACH_CP_SRC ST_ATTACH_CP_DST ST_ATTACH_AGENT_LIST ST_AGENT_LIST_MOVE_AFTER ST_ATTACH_SLEEP \
+    ST_POLL_INTERVAL ST_MAX_ATTACH
+  if st_expect_status "the seat on a confirmed agent list still returns normally" 0; then
+    count="$(st_count_notify "The pointer moved to seat-2")"
+    if [ "$count" -eq 1 ]; then
+      st_ok
+    else
+      st_fail "a confirmed agent list notifies well ahead of the 681-second threshold, once inside the spacing" \
+        "notification count is not 1: ${count}: $(cat "$ST_NOTIFY")"
+    fi
+    elapsed="$(st_latest_notify_elapsed)"
+    case "$elapsed" in
+      '' | *[!0-9]*)
+        st_fail "the notification says how long ago the pointer moved" "unreadable: ${elapsed}"
+        ;;
+      *)
+        if [ "$elapsed" -le 1 ]; then
+          st_ok
+        else
+          st_fail "it fires on the first round that sees the pointer differ" \
+            "the pointer had moved ${elapsed} seconds before the notification"
+        fi
+        ;;
+    esac
+    st_expect_notify_leads_with "the notification opens with the definite instruction" "$definite_prefix"
+    if [ "$(st_count_seat_log_event handover_stalled)" = "1" ]; then
+      st_ok
+    else
+      st_fail "the early firing is recorded in the seat log" "$(st_seat_log_events)"
+    fi
+    st_expect_seat_log_line "the record carries the definite instruction" handover_stalled \
+      "$REIN_SEAT_AGENT_LIST_HINT"
+    st_expect_agent_list_untouched "rein never signals the agent list's process, which lives out its hold"
+    st_expect_seat_log_line "and attach returns on its own, not killed" attach_ended "rc=0"
+    if [ "$(rein_st_count_calls "$ST_LOG" attach job-seat-1)" -eq 1 ]; then
+      st_ok
+    else
+      st_fail "the agent list is never reattached or replaced" "$(cat "$ST_LOG")"
+    fi
+  fi
+
+  # The same handover with attach still `claude attach`: nothing is confirmed, so the threshold
+  # stays in charge and a five-second hold under the default config produces nothing.
+  case_dir="$tmp/agent-list-attach-argv"
+  st_setup_case "$case_dir"
+  rein_st_write_agents "$ST_AGENTS" "$ST_CWD" "seat-1" "seat-2"
+  rein_st_write_pointer "$ST_POINTER" "seat-1" "predecessor" "$ST_CWD" 1
+  rein_st_write_pointer "$ST_CWD/next-pointer.json" "seat-2" "successor" "$ST_CWD" 2
+  ST_ATTACH_CP_SRC="$ST_CWD/next-pointer.json"
+  ST_ATTACH_CP_DST="$ST_POINTER"
+  ST_ATTACH_SLEEP=5
+  ST_MAX_ATTACH=1
+  st_run_seat
+  unset ST_ATTACH_CP_SRC ST_ATTACH_CP_DST ST_ATTACH_SLEEP ST_MAX_ATTACH
+  if st_expect_status "a stall still on claude attach returns normally" 0; then
+    if [ "$(st_count_notify "The pointer moved to")" -eq 0 ] &&
+      [ "$(st_count_seat_log_event handover_stalled)" = "0" ]; then
+      st_ok
+    else
+      st_fail "an attach process still on claude attach waits out the threshold" \
+        "it fired inside the threshold: $(cat "$ST_NOTIFY")"
+    fi
+  fi
+
+  # The agent list, but `ps` won't answer the argv query while it still answers the start-time
+  # and liveness ones, so the seat itself stays confirmed and only the list goes unconfirmed:
+  # unconfirmable is never taken as the list. Under the minimal config (a 16-second threshold)
+  # it fires once the threshold has passed, with the conditional wording. (A `ps` that answers
+  # nothing at all is not this case: the watchdog can't confirm its own parent then, and stays
+  # quiet by design.)
+  case_dir="$tmp/agent-list-argv-unanswered"
+  st_setup_case "$case_dir"
+  shim_dir="$case_dir/ps-bin"
+  rein_st_write_ps_without_argv "$shim_dir"
+  rein_st_write_agents "$ST_AGENTS" "$ST_CWD" "seat-1" "seat-2"
+  rein_st_write_pointer "$ST_POINTER" "seat-1" "predecessor" "$ST_CWD" 1
+  rein_st_write_pointer "$ST_CWD/next-pointer.json" "seat-2" "successor" "$ST_CWD" 2
+  ST_BROKEN_BIN="$shim_dir"
+  ST_ATTACH_CP_SRC="$ST_CWD/next-pointer.json"
+  ST_ATTACH_CP_DST="$ST_POINTER"
+  ST_ATTACH_AGENT_LIST=1
+  ST_AGENT_LIST_MOVE_AFTER=1
+  ST_ATTACH_SLEEP=19
+  ST_EXIT_GRACE=0
+  ST_STOP_TIMEOUT=0
+  ST_CMD_TIMEOUT=1
+  ST_MAX_ATTACH=1
+  st_run_seat
+  unset ST_BROKEN_BIN ST_ATTACH_CP_SRC ST_ATTACH_CP_DST ST_ATTACH_AGENT_LIST ST_AGENT_LIST_MOVE_AFTER \
+    ST_ATTACH_SLEEP ST_EXIT_GRACE ST_STOP_TIMEOUT ST_CMD_TIMEOUT ST_MAX_ATTACH
+  if st_expect_status "a stall whose argv ps won't give returns normally" 0; then
+    count="$(st_count_notify "The pointer moved to seat-2")"
+    elapsed="$(st_latest_notify_elapsed)"
+    case "$elapsed" in
+      '' | *[!0-9]*) elapsed=-1 ;;
+    esac
+    if [ "$count" -eq 1 ] && [ "$elapsed" -gt 16 ]; then
+      st_ok
+    else
+      st_fail "an argv ps won't give falls back to the threshold" \
+        "count=${count}, seconds since the move=${elapsed} (expected 1 firing after 16): $(cat "$ST_NOTIFY")"
+    fi
+    st_expect_notify_leads_with "and says it conditionally" "$conditional_prefix"
+    st_expect_notify_lacks_definite "and never claims the agent list it could not confirm"
+  fi
+
+  # The list is open but the pointer never moves: that is where the user chose to be, so nothing
+  # fires -- the confirmation alone is never a reason to notify.
+  case_dir="$tmp/agent-list-in-step"
+  st_setup_case "$case_dir"
+  rein_st_write_pointer "$ST_POINTER" "seat-1" "still-here" "$ST_CWD" 1
+  ST_ATTACH_AGENT_LIST=1
+  ST_ATTACH_SLEEP=3
+  ST_MAX_ATTACH=1
+  st_run_seat
+  unset ST_ATTACH_AGENT_LIST ST_ATTACH_SLEEP ST_MAX_ATTACH
+  if st_expect_status "an agent list with the pointer in step returns normally" 0; then
+    if [ "$(st_count_notify "The pointer moved to")" -eq 0 ] &&
+      [ "$(st_count_seat_log_event handover_stalled)" = "0" ]; then
+      st_ok
+    else
+      st_fail "an agent list with the pointer in step never notifies" "$(cat "$ST_NOTIFY")"
+    fi
+    st_expect_agent_list_untouched "and the list is left alone"
+  fi
+
+  # The confirmation itself and the repeat, against a live `claude agents` process started here
+  # (the fixture's agent list, with a known pid and start time). The spacing's floor is five
+  # minutes in a real seat, too long for a case, so the watchdog is called directly with a short
+  # spacing: it must fire on the first round and then keep firing at that spacing -- not once,
+  # and not on every 0.2-second poll.
+  case_dir="$tmp/agent-list-repeat"
+  st_setup_case "$case_dir"
+  rein_st_write_pointer "$ST_POINTER" "seat-2" "successor" "$ST_CWD" 2
+  (cd "$ST_BIN/agent-list" && FAKE_LOG="$ST_LOG" FAKE_ATTACH_SLEEP_SEC=12 exec -a claude "$BASH" agents) &
+  list_pid=$!
+  i=0
+  while [ "$i" -lt 50 ] && [ "$(rein_ps_command "$list_pid")" != "claude agents" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  list_start="$(rein_process_start_identity "$list_pid")"
+  if seat_attach_on_agent_list "$list_pid" "$list_start"; then
+    st_ok
+  else
+    st_fail "a process that became claude agents is confirmed as the agent list" \
+      "argv=$(rein_ps_command "$list_pid") start=${list_start}"
+  fi
+  if seat_attach_on_agent_list "$list_pid" "Thu Jan  1 00:00:00 1970"; then
+    st_fail "a pid now held by a different process is not confirmed" "a start time that differs was accepted"
+  else
+    st_ok
+  fi
+  if seat_attach_on_agent_list "$list_pid" ""; then
+    st_fail "no recorded start time is not confirmed" "an empty start time was accepted"
+  else
+    st_ok
+  fi
+  rein_st_write_ps_without_argv "$case_dir/ps-bin"
+  if PATH="$case_dir/ps-bin:$PATH" seat_attach_on_agent_list "$list_pid" "$list_start"; then
+    st_fail "a ps that won't give the argv is not confirmed" "it was confirmed without the argv"
+  else
+    st_ok
+  fi
+  if seat_attach_on_agent_list "$$" "$(rein_process_start_identity "$$")"; then
+    st_fail "a live process that is not claude agents is not confirmed" "argv=$(rein_ps_command "$$")"
+  else
+    st_ok
+  fi
+  # The fake attach shows up as `bash <path>/claude attach ...`, whose argv[0] is not `claude`, so
+  # it can't tell a judgment that reads the second word from one that only checks for `claude`.
+  # The real attach's argv is exactly `claude attach <id>`, so that shape is started here the way
+  # the list is, and it has to stay unconfirmed.
+  mkdir -p "$case_dir/attach-argv"
+  cat >"$case_dir/attach-argv/attach" <<'EOF'
+while [ -e "$FAKE_HOLD" ]; do sleep 0.1; done
+EOF
+  : >"$case_dir/attach-hold"
+  (cd "$case_dir/attach-argv" && FAKE_HOLD="$case_dir/attach-hold" exec -a claude "$BASH" attach job-seat-1) &
+  attach_pid=$!
+  i=0
+  while [ "$i" -lt 50 ] && [ "$(rein_ps_command "$attach_pid")" != "claude attach job-seat-1" ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [ "$(rein_ps_command "$attach_pid")" != "claude attach job-seat-1" ]; then
+    st_fail "the real attach's argv shape is started for the check" "argv=$(rein_ps_command "$attach_pid")"
+  elif seat_attach_on_agent_list "$attach_pid" "$(rein_process_start_identity "$attach_pid")"; then
+    st_fail "a process still on claude attach <id> is not confirmed" "argv=$(rein_ps_command "$attach_pid")"
+  else
+    st_ok
+  fi
+  rm -f "$case_dir/attach-hold"
+  wait "$attach_pid" 2>/dev/null
+  printf '%s\n%s\n' "$list_pid" "$list_start" >"$case_dir/attach-record"
+  sentinel="$case_dir/sentinel"
+  : >"$sentinel"
+  (
+    unset REIN_NOTIFY_SILENT
+    TARGET_CWD="$ST_CWD"
+    POINTER_FILE="$ST_POINTER"
+    RECORDS_DIR="$ST_RECORDS"
+    SEAT_LOG_FILE="$ST_SEAT_LOG"
+    POLL_INTERVAL_SEC=0.2
+    PATH="$ST_BIN:$PATH" FAKE_NOTIFY_LOG="$ST_NOTIFY" FAKE_LOG="$ST_LOG" \
+      run_attach_watchdog "seat-1" "$sentinel" "$$" "$(rein_process_start_identity "$$")" 600 3 \
+      "$case_dir/attach-record"
+  ) >"$case_dir/watchdog.out" 2>&1 &
+  wd_pid=$!
+  sleep 9
+  rm -f "$sentinel"
+  wait "$wd_pid" 2>/dev/null
+  wait "$list_pid" 2>/dev/null
+  count="$(st_count_notify "$REIN_SEAT_AGENT_LIST_HINT")"
+  if [ "$count" -ge 3 ] && [ "$count" -le 4 ]; then
+    st_ok
+  else
+    st_fail "a confirmed agent list keeps notifying at the spacing while out of step" \
+      "notification count is not within 3..4 in 9 seconds at a 3-second spacing: ${count}: $(cat "$case_dir/watchdog.out")"
+  fi
+  if [ "$(st_count_seat_log_event handover_stalled)" = "$count" ] &&
+    [ "$(rein_st_calls_total "$ST_NOTIFY")" = "$count" ]; then
+    st_ok
+  else
+    st_fail "every repeat is the definite one and is recorded" \
+      "$(rein_st_calls_total "$ST_NOTIFY") notifications, $(st_count_seat_log_event handover_stalled) records, ${count} definite"
+  fi
+  st_expect_agent_list_untouched "the watchdog never signals the agent list while repeating"
 }
 
 # The section that measures the test scaffolding itself (how the process fixture is started, and

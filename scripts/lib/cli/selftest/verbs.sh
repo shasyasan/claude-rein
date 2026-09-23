@@ -784,12 +784,16 @@ EOF
   # A mismatch the user can't act on is the defect the notification had too, so the line carries
   # the same one instruction (held in one place, so the two surfaces can't diverge).
   st_expect_seat_line "the mismatch names the way out" "$REIN_SEAT_DETACH_HINT"
-  # **The wording itself, once, as a literal.** Every other check on this instruction -- here and
-  # in the seat's own selftest -- reads it from the same constant the code prints, so gutting the
-  # constant into something that tells the user nothing would leave the whole suite green. This
-  # is the one place that would go red.
+  # **The wording itself, once, as a literal.** The check above reads it from the same constant
+  # the code prints, so gutting the constant into something that tells the user nothing would
+  # leave it green. This is the place that goes red for the status line (the seat's own selftest
+  # pins the watchdog's two wordings the same way).
   st_expect_seat_line "and the instruction is the real one, not whatever the constant now holds" \
-    "leave the agent list screen and the seat reconnects to the successor on its own"
+    "if the seat's terminal has become the agent list, press Esc twice (or Ctrl+C twice) on the list itself -- first press the left arrow key if a session is open in it -- and the seat reconnects to the successor on its own"
+  # `rein status` never inspects the attach process, so it can't know whether the terminal has
+  # become the agent list and must never say it has.
+  st_expect_seat_line_lacks "and the status line never claims the terminal has become the agent list" \
+    "this seat's terminal has become the agent list"
   st_run_env --root "$root2" --cwd "$proj2" status --json
   if [ "$(printf '%s' "$ST_OUT" | jq -r '.seat.pointer_match' 2>/dev/null)" = "false" ]; then
     st_ok

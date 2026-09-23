@@ -298,3 +298,8 @@ config home.
 - **Claude Code's own `claude attach` goes around it.** rein keeps one terminal per lineage, but a terminal attached
   with the base command isn't something rein can see, let alone refuse. It dies with the session at the next handover.
   If you've lost your terminal, `rein attach` gives you one that follows the handovers.
+- **The agent list you open with ← stays yours.** Pressing ← on an empty prompt turns the terminal into Claude Code's
+  agent list, and it stays the list's even after you open a session again from it, so it no longer follows handovers.
+  rein won't take that screen away from you; when a handover happens it only notifies you ("rein: the handover is not
+  being followed"). To catch up, go back to the list if a session is open in it, then press Esc twice (or Ctrl+C
+  twice). The list closes and the terminal moves to the successor on its own.
