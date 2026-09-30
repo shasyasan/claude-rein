@@ -281,6 +281,133 @@ st_section_bootstrap() {
     fi
   fi
 
+  # The pointer's session is listed as stopped, but its process is still running. Such a session
+  # is not finished -- a background task's completion notice wakes it and it carries on working --
+  # so launching the next generation without stopping it leaves two primary sessions in the same
+  # working tree. The listing alone cannot tell this apart (it is exactly what said "not live"), so
+  # the material is the listed pid's process itself: bootstrap stops the session first, and only
+  # then advances the generation. The process is a real one the case starts, detached so that the
+  # host reaps it once the fake stop ends it (a child of this shell would linger as a zombie, which
+  # `ps` still lists).
+  case_dir="$tmp/bootstrap-listed-stopped-running"
+  st_setup_case "$case_dir"
+  printf 'handoff fixture\n' >"$ST_RECORDS/$REIN_HANDOFF_BASENAME"
+  rein_st_write_pointer "$ST_RECORDS/$REIN_POINTER_BASENAME" "pred-1" "predecessor" "$ST_CWD" 15
+  st_running_pid="$( (sleep 30 >/dev/null 2>&1 & printf '%s' "$!") )"
+  rein_st_write_agents_listed_stopped "$ST_AGENTS" "$ST_CWD" "$st_running_pid" "pred-1"
+  ST_ENV_EXTRA=("FAKE_STOP_KILL_PID=$st_running_pid")
+  st_run_watcher
+  ST_ENV_EXTRA=()
+  kill "$st_running_pid" 2>/dev/null
+  if st_expect_status "bootstrap stops a listed-stopped session whose process runs, then launches" 0; then
+    if ! rein_st_has_call "$ST_LOG" stop job-pred-1; then
+      st_fail "bootstrap stops the pointer's session whose process still runs" "claude stop was never called: $(cat "$ST_LOG")"
+    elif [ "$(rein_st_call_index "$ST_LOG" "stop")" -gt "$(rein_st_call_index "$ST_LOG" "--bg")" ]; then
+      st_fail "bootstrap stops the running session before launching the next generation" "$(cat "$ST_LOG")"
+    elif [ "$(jq -r '.generation' "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)" != "16" ]; then
+      st_fail "bootstrap advances the generation after the stop" "$(cat "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)"
+    elif [ -z "$(jq -r 'select(.event == "predecessor_stopped" and .predecessor_session_id == "pred-1") | .detail' \
+      "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)" ]; then
+      st_fail "bootstrap records the stop of the running session" "$(cat "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)"
+    else
+      st_ok
+    fi
+  fi
+  # The judgment itself is left in the handover log: the listing's row for the pointer's session
+  # (status, state, pid), what its process looked like, and the verdict. Without it, a round that
+  # launched past a still-running session cannot later say why it judged "not live".
+  st_judged="$(jq -r 'select(.event == "bootstrap_liveness_judged" and .predecessor_session_id == "pred-1") | .detail' \
+    "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)"
+  case "$st_judged" in
+    *'"status":"stopped"'*'"state":"working"'*"\"pid\":${st_running_pid}"*"process=running"*)
+      st_ok
+      ;;
+    *)
+      st_fail "bootstrap records the listing row and the process check it judged by" \
+        "${st_judged:-no judgment line: $(cat "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)}"
+      ;;
+  esac
+
+  # The stop was issued but the process is still there -- abort the same way a handover does when
+  # it cannot step its predecessor down, and never launch a second primary session. Confirming the
+  # stop by the listing would pass here at once (the listing already said "not live" before the
+  # stop), so this is what pins the confirmation to the process itself.
+  case_dir="$tmp/bootstrap-listed-stopped-unstoppable"
+  st_setup_case "$case_dir"
+  printf 'handoff fixture\n' >"$ST_RECORDS/$REIN_HANDOFF_BASENAME"
+  rein_st_write_pointer "$ST_RECORDS/$REIN_POINTER_BASENAME" "pred-1" "predecessor" "$ST_CWD" 15
+  st_running_pid="$( (sleep 30 >/dev/null 2>&1 & printf '%s' "$!") )"
+  rein_st_write_agents_listed_stopped "$ST_AGENTS" "$ST_CWD" "$st_running_pid" "pred-1"
+  ST_STOP_INEFFECTIVE=1
+  st_run_watcher
+  unset ST_STOP_INEFFECTIVE
+  kill "$st_running_pid" 2>/dev/null
+  if st_expect_status "aborts bootstrap when the running session cannot be stopped" 1; then
+    if [ "$(rein_st_count_sub "$ST_LOG" "--bg")" -ne 0 ]; then
+      st_fail "never launches a second primary session beside a session it could not stop" "claude --bg was called: $(cat "$ST_LOG")"
+    elif [ "$(jq -r '.generation' "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)" != "15" ]; then
+      st_fail "leaves the pointer alone when the stop did not take" "$(cat "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)"
+    elif ! st_expect_notify "notifies that the running session could not be stopped" \
+      "rein: handover failed" "still running"; then
+      :
+    else
+      st_ok
+    fi
+  fi
+
+  # The proceeding side: listed as stopped and its pid names no process -- the session really is
+  # finished, so bootstrap advances as before, with no stop at all (the judgment is still recorded).
+  case_dir="$tmp/bootstrap-listed-stopped-gone"
+  st_setup_case "$case_dir"
+  printf 'handoff fixture\n' >"$ST_RECORDS/$REIN_HANDOFF_BASENAME"
+  rein_st_write_pointer "$ST_RECORDS/$REIN_POINTER_BASENAME" "pred-1" "predecessor" "$ST_CWD" 15
+  rein_st_write_agents_listed_stopped "$ST_AGENTS" "$ST_CWD" 999999 "pred-1"
+  st_run_watcher
+  if st_expect_status "bootstrap advances past a listed-stopped session whose process is gone" 0; then
+    if [ "$(rein_st_count_sub "$ST_LOG" "stop")" -ne 0 ]; then
+      st_fail "never stops a session whose process is already gone" "$(cat "$ST_LOG")"
+    elif [ "$(jq -r '.generation' "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)" != "16" ]; then
+      st_fail "advances the generation past a finished session" "$(cat "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)"
+    else
+      st_ok
+    fi
+  fi
+  st_judged="$(jq -r 'select(.event == "bootstrap_liveness_judged" and .predecessor_session_id == "pred-1") | .detail' \
+    "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)"
+  case "$st_judged" in
+    *'"status":"stopped"'*'"pid":999999'*"process=gone"*) st_ok ;;
+    *)
+      st_fail "records a gone process in the judgment line" \
+        "${st_judged:-no judgment line: $(cat "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)}"
+      ;;
+  esac
+
+  # The proceeding side with no pid to check: the pointer's session is not in the listing at all
+  # (a finished session drops its pid and leaves the normal listing). Advances with no stop.
+  case_dir="$tmp/bootstrap-pointer-unlisted"
+  st_setup_case "$case_dir"
+  printf 'handoff fixture\n' >"$ST_RECORDS/$REIN_HANDOFF_BASENAME"
+  rein_st_write_pointer "$ST_RECORDS/$REIN_POINTER_BASENAME" "gone-1" "predecessor" "$ST_CWD" 15
+  st_run_watcher
+  if st_expect_status "bootstrap advances past a pointer whose session is not listed" 0; then
+    if [ "$(rein_st_count_sub "$ST_LOG" "stop")" -ne 0 ]; then
+      st_fail "never stops anything when the pointer's session has no pid" "$(cat "$ST_LOG")"
+    elif [ "$(jq -r '.generation' "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)" != "16" ]; then
+      st_fail "advances the generation past an unlisted session" "$(cat "$ST_RECORDS/$REIN_POINTER_BASENAME" 2>/dev/null)"
+    else
+      st_ok
+    fi
+  fi
+  st_judged="$(jq -r 'select(.event == "bootstrap_liveness_judged" and .predecessor_session_id == "gone-1") | .detail' \
+    "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)"
+  case "$st_judged" in
+    *"row=absent"*"process=no pid in the listing"*) st_ok ;;
+    *)
+      st_fail "records an unlisted session in the judgment line" \
+        "${st_judged:-no judgment line: $(cat "$ST_RECORDS/$REIN_LOG_BASENAME" 2>/dev/null)}"
+      ;;
+  esac
+
   ST_MODE_ARGS=(--once)
 
 }

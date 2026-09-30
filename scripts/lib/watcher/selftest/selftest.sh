@@ -102,6 +102,7 @@ selftest() {
   # section boundaries, so they're declared here rather than inside a section (declaring one
   # inside a section's own function would hide it from later sections).
   local settings_file settings_json st_seat_log_leak hb_probe records_outside records_outside_before
+  local st_running_pid st_judged
 
   rein_st_sections_parse "$@" || return $?
   if [ "$REIN_ST_SECTION_MODE" = "list" ]; then

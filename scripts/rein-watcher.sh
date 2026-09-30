@@ -102,6 +102,8 @@ POINTER_ERROR=""
 POINTER_GENERATION=""
 CLAIMED_MARKER=""
 SUCCESSOR_ID=""
+BOOTSTRAP_POINTER_PID=""
+BOOTSTRAP_PID_RC=""
 CONFIG_ERROR_LAST=""
 # The gap watch (see check_lineage_gap). All three are epoch seconds or a flag, and all three are
 # seeded the moment monitoring starts -- a watcher that has only just come up has not yet seen
@@ -1292,6 +1294,43 @@ fail_successor_gone() {
   return 1
 }
 
+# Issue the external stop to the predecessor, from the short job ID the caller resolved
+# (`rein_resolve_job_handle`'s output and exit code). Only the issuing -- **confirming** the stop is
+# left to the caller, because the material differs: a handover confirms by the listing, while
+# bootstrap reaches here exactly when the listing already says "not live" and so has to confirm by
+# the process itself. The resolution stays in each caller's own body: it runs an enumeration, and
+# the seat's watchdog threshold counts retire_predecessor's enumerations from its body.
+# `why` is the reason the predecessor is being stopped, carried into the one failure sentence that
+# needs it (an interactive session that cannot be stopped).
+# 0=the stop was issued / 1=stage failure (reason already recorded by fail_stage)
+issue_predecessor_stop() {
+  local generation="$1" predecessor="$2" successor_id="$3" why="$4" stop_handle="$5" handle_rc="$6"
+  local stop_rc detail
+  if [ "$handle_rc" -eq 3 ]; then
+    # An interactive session has no short job ID -- it cannot be the target of claude stop (measured).
+    printf -v detail 'an interactive session cannot be stopped externally (%s): %s' "$why" "$predecessor"
+    fail_stage "stopping the predecessor" "$detail" "$generation" "$predecessor" "$successor_id"
+    return 1
+  fi
+  if [ "$handle_rc" -ne 0 ]; then
+    detail="$(rein_job_handle_error "$predecessor" "$handle_rc")"
+    fail_stage "stopping the predecessor" "$detail" "$generation" "$predecessor" "$successor_id"
+    return 1
+  fi
+  if ! write_heartbeat; then
+    fail_heartbeat "$generation" "$predecessor" "$successor_id"
+    return 1
+  fi
+  (cd "$TARGET_CWD" && rein_run_capture "$CMD_TIMEOUT_SEC" claude stop "$stop_handle" >/dev/null)
+  stop_rc=$?
+  if [ "$stop_rc" -ne 0 ]; then
+    printf -v detail 'claude stop exited non-zero: %s' "$(rein_command_failure_detail "$stop_rc")"
+    fail_stage "stopping the predecessor" "$detail" "$generation" "$predecessor" "$successor_id"
+    return 1
+  fi
+  return 0
+}
+
 # The stage that steps the predecessor down (confirm exit within the grace period -> external stop
 # if it is still there -> confirm the stop). The predecessor has no means of self-termination
 # (measured). If it is gone within the grace period, confirming is enough; if it is still there,
@@ -1307,7 +1346,7 @@ fail_successor_gone() {
 # 0=the predecessor is gone / 1=stage failure (reason already recorded by fail_stage)
 retire_predecessor() {
   local generation="$1" predecessor="$2" successor_id="$3"
-  local exit_rc stop_handle handle_rc stop_rc stop_wait_rc detail
+  local exit_rc stop_handle handle_rc stop_wait_rc detail
   wait_for_exit "$predecessor" "$EXIT_GRACE_SEC" "$successor_id"
   exit_rc=$?
   case "$exit_rc" in
@@ -1332,7 +1371,8 @@ retire_predecessor() {
   # the foreground -- the enumeration that resolves the job handle, then `claude stop` -- and
   # nothing else writes the heartbeat while they do. wait_for_exit above returns on the cycle it
   # hits its deadline **without** writing, so without these the heartbeat would already be one
-  # poll old when this stretch starts. One write before each blocking call.
+  # poll old when this stretch starts. One write before each blocking call (the second is inside
+  # issue_predecessor_stop).
   if ! write_heartbeat; then
     fail_heartbeat "$generation" "$predecessor" "$successor_id"
     return 1
@@ -1341,29 +1381,8 @@ retire_predecessor() {
   # accept the full session_id).
   stop_handle="$(rein_resolve_job_handle "$predecessor")"
   handle_rc=$?
-  if [ "$handle_rc" -eq 3 ]; then
-    # An interactive session has no short job ID -- it cannot be the target of claude stop (measured).
-    printf -v detail 'an interactive session cannot be stopped externally (did not exit within the %s-second grace period): %s' \
-      "$EXIT_GRACE_SEC" "$predecessor"
-    fail_stage "stopping the predecessor" "$detail" "$generation" "$predecessor" "$successor_id"
-    return 1
-  fi
-  if [ "$handle_rc" -ne 0 ]; then
-    detail="$(rein_job_handle_error "$predecessor" "$handle_rc")"
-    fail_stage "stopping the predecessor" "$detail" "$generation" "$predecessor" "$successor_id"
-    return 1
-  fi
-  if ! write_heartbeat; then
-    fail_heartbeat "$generation" "$predecessor" "$successor_id"
-    return 1
-  fi
-  (cd "$TARGET_CWD" && rein_run_capture "$CMD_TIMEOUT_SEC" claude stop "$stop_handle" >/dev/null)
-  stop_rc=$?
-  if [ "$stop_rc" -ne 0 ]; then
-    printf -v detail 'claude stop exited non-zero: %s' "$(rein_command_failure_detail "$stop_rc")"
-    fail_stage "stopping the predecessor" "$detail" "$generation" "$predecessor" "$successor_id"
-    return 1
-  fi
+  printf -v detail 'did not exit within the %s-second grace period' "$EXIT_GRACE_SEC"
+  issue_predecessor_stop "$generation" "$predecessor" "$successor_id" "$detail" "$stop_handle" "$handle_rc" || return 1
   # Do not collapse "cannot read the listing (undetermined)" into "stopping did not make it go
   # away". Collapsing them would record and notify a broken CLI as a different cause (the external
   # stop not taking effect).
@@ -2268,6 +2287,128 @@ resolve_paths() {
   return 0
 }
 
+# Record bootstrap's liveness judgment of the pointer's session as one handover-log line: the
+# listing's row it judged by (status, state, pid), what the listed pid's process looked like, and
+# the verdict. Without this line a round that launched past a still-running session leaves nothing
+# to say why it judged "not live".
+# The process is looked at only when the listing says "not live" and gives a pid: the listing
+# alone cannot tell a finished session from one it calls stopped while its process keeps running
+# (such a session wakes on a background task's completion notice and carries on working, beside
+# the next generation bootstrap is about to launch).
+# Sets BOOTSTRAP_POINTER_PID and BOOTSTRAP_PID_RC (rein_pid_alive's 0=running / 1=gone /
+# 2=cannot be confirmed; empty when the process was not looked at).
+# 0=recorded / 1=cannot record (reason already recorded by fail_stage)
+record_pointer_liveness() {
+  local generation="$1" session_id="$2" agents="$3" live_rc="$4" row process verdict detail
+  BOOTSTRAP_POINTER_PID=""
+  BOOTSTRAP_PID_RC=""
+  row="$(printf '%s' "$agents" | jq -r --arg id "$session_id" '
+    first(.[] | select(.sessionId == $id)
+      | {status: (.status // null), state: (.state // null), pid: (.pid // null)} | tojson)
+    // "absent"' 2>/dev/null)"
+  row="${row:-unreadable}"
+  process="not looked at"
+  case "$live_rc" in
+    0) verdict="live (aborting: bootstrap is unnecessary)" ;;
+    1)
+      BOOTSTRAP_POINTER_PID="$(printf '%s' "$agents" | jq -r --arg id "$session_id" '
+        first(.[] | select(.sessionId == $id) | (.pid // empty) | tostring) // empty' 2>/dev/null)"
+      if [ -z "$BOOTSTRAP_POINTER_PID" ]; then
+        process="no pid in the listing"
+        verdict="not live (launching the next generation)"
+      else
+        rein_pid_alive "$BOOTSTRAP_POINTER_PID"
+        BOOTSTRAP_PID_RC=$?
+        case "$BOOTSTRAP_PID_RC" in
+          0)
+            process="running"
+            verdict="listed as not live, but its process is running (stopping it before launching)"
+            ;;
+          1)
+            process="gone"
+            verdict="not live (launching the next generation)"
+            ;;
+          *)
+            process="cannot be confirmed"
+            verdict="undetermined (aborting: cannot confirm whether its process is running)"
+            ;;
+        esac
+      fi
+      ;;
+    *) verdict="undetermined (aborting: cannot read the listing)" ;;
+  esac
+  printf -v detail 'row=%s process=%s verdict=%s' "$row" "$process" "$verdict"
+  log_event_or_fail "bootstrap_liveness_judged" "$detail" "$generation" "$session_id" ""
+}
+
+# 0=gone / 1=expired, still running / 2=cannot be confirmed / 4=cannot write the heartbeat
+wait_for_pid_exit() {
+  local pid="$1" timeout="$2" deadline now rc
+  deadline="$(($(rein_now_monotonic) + timeout))"
+  while :; do
+    rein_pid_alive "$pid"
+    rc=$?
+    if [ "$rc" -eq 1 ]; then
+      return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
+      return 2
+    fi
+    now="$(rein_now_monotonic)"
+    if [ "$now" -ge "$deadline" ]; then
+      return 1
+    fi
+    if ! write_heartbeat; then
+      return 4
+    fi
+    rein_sleep_capped "$POLL_INTERVAL_SEC" "$((deadline - now))"
+  done
+}
+
+# Stop the pointer's session that the listing calls "not live" while its process runs, before
+# bootstrap launches the next generation. Goes through the same stop as a handover
+# (issue_predecessor_stop), but confirms by the process: the listing said "not live" before the stop
+# was ever issued, so confirming by it would pass whether or not the stop took.
+# **Stops before the launch**, unlike a handover (which launches first and stops after the pointer
+# moves): the user asked for a new primary session with `rein up`, and a stop that does not take
+# must leave no second primary session behind -- aborting here, before anything launched, is the
+# only point where that still holds without stepping a launched session down again.
+# 0=stopped / 1=stage failure (reason already recorded by fail_stage)
+stop_running_pointer_session() {
+  local generation="$1" predecessor="$2" pid="$3" why detail wait_rc stop_handle handle_rc
+  printf -v why 'listed as not live, but its process pid=%s is still running' "$pid"
+  if ! write_heartbeat; then
+    fail_heartbeat "$generation" "$predecessor"
+    return 1
+  fi
+  stop_handle="$(rein_resolve_job_handle "$predecessor")"
+  handle_rc=$?
+  issue_predecessor_stop "$generation" "$predecessor" "" "$why" "$stop_handle" "$handle_rc" || return 1
+  wait_for_pid_exit "$pid" "$STOP_TIMEOUT_SEC"
+  wait_rc=$?
+  case "$wait_rc" in
+    0) ;;
+    4)
+      fail_heartbeat "$generation" "$predecessor"
+      return 1
+      ;;
+    2)
+      printf -v detail 'cannot confirm whether pid=%s is still running (ps did not answer, while confirming exit after the external stop)' "$pid"
+      fail_stage "confirming the predecessor's stop" "$detail" "$generation" "$predecessor"
+      return 1
+      ;;
+    *)
+      printf -v detail 'pid=%s still running %s seconds after claude stop (not launching the next generation beside it)' \
+        "$pid" "$STOP_TIMEOUT_SEC"
+      fail_stage "confirming the predecessor's stop" "$detail" "$generation" "$predecessor"
+      return 1
+      ;;
+  esac
+  printf -v detail '%s, so it was stopped externally before launching the next generation' "$why"
+  rein_log_event "$LOG_FILE" "predecessor_stopped" "$detail" "$generation" "$predecessor" ""
+  return 0
+}
+
 # The entry point for the handover's first cycle (cold start). The attach loop can only attach
 # once a current pointer exists, so this module launches the primary session too (kept as the one
 # writer of the pointer, the watcher, rather than placed in rein-seat.sh).
@@ -2360,6 +2501,7 @@ run_bootstrap() {
       agents="$(rein_list_agents)"
       rein_is_session_live "$session_id" "$agents"
       live_rc=$?
+      record_pointer_liveness "$((pointer_gen + 1))" "$session_id" "$agents" "$live_rc" || return 1
       if [ "$live_rc" -eq 0 ]; then
         printf -v detail 'the current pointer already points at a live session, %s (bootstrap is unnecessary)' "$session_id"
         rein_notify "rein: aborted bootstrap" "$detail"
@@ -2374,6 +2516,15 @@ run_bootstrap() {
         # one is deciding whether to launch a primary session, the other is deciding whether to
         # adopt leftover work, and what the user does next differs.
         printf -v detail '%s (cannot judge whether the existing pointer is live, or whether a predecessor is left behind either)' "$(rein_list_agents_error)"
+        printf '%s: %s\n' "$SCRIPT_NAME" "$detail" >&2
+        rein_notify "rein: aborted bootstrap" "$detail"
+        return 1
+      fi
+      # The same "do not silently fall through" for the process check: `ps` not answering is not
+      # "the process is gone".
+      if [ "$BOOTSTRAP_PID_RC" = "2" ]; then
+        printf -v detail 'cannot confirm whether the process of the session the pointer names is still running (ps did not answer): session_id=%s pid=%s' \
+          "$session_id" "$BOOTSTRAP_POINTER_PID"
         printf '%s: %s\n' "$SCRIPT_NAME" "$detail" >&2
         rein_notify "rein: aborted bootstrap" "$detail"
         return 1
@@ -2435,6 +2586,12 @@ run_bootstrap() {
     printf '%s: %s\n' "$SCRIPT_NAME" "$detail" >&2
     rein_notify "rein: aborted bootstrap" "$detail"
     return 1
+  fi
+
+  # Placed after every refusal above, so a round that is going to refuse anyway never stops the
+  # session first.
+  if [ "$BOOTSTRAP_PID_RC" = "0" ]; then
+    stop_running_pointer_session "$generation" "$session_id" "$BOOTSTRAP_POINTER_PID" || return 1
   fi
 
   EXIT_REASON="launched the primary session"

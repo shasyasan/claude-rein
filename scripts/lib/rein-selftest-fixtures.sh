@@ -903,6 +903,12 @@ case "$sub" in
       '[ .[] | if (.id // "") == $jid then del(.pid, .status) + {state: "done"} else . end ]' \
       "$FAKE_AGENTS" >"$tmp"
     mv "$tmp" "$FAKE_AGENTS"
+    # Ends a real process the case started itself, standing in for the session's process going
+    # away with the stop. Only ever the pid the case names explicitly -- the fixtures' own pids
+    # (4242, 9001) are made-up numbers that may belong to an unrelated process on the host.
+    if [ -n "${FAKE_STOP_KILL_PID:-}" ]; then
+      kill "$FAKE_STOP_KILL_PID" 2>/dev/null
+    fi
     ;;
   rm)
     # The real CLI's `claude rm <id>` "deletes a finished background session and its worktree".
@@ -1144,6 +1150,20 @@ rein_st_write_agents_idle() {
     '[ $ARGS.positional[]
        | {pid: 4242, cwd: $cwd, kind: "background", startedAt: $started,
           id: ("job-" + .), sessionId: ., name: "predecessor", state: "done", status: "idle"} ]' \
+    --args "$@" >"$file"
+}
+
+# A background session the listing calls stopped while it still carries a pid. **Not a measured
+# shape** -- it is the suspected state of a primary session that bootstrap judged "not live" while
+# its process kept running (and later woke on a background task's completion notice). The pid is
+# the caller's, so a case can point it at a real process that is running or already gone.
+rein_st_write_agents_listed_stopped() {
+  local file="$1" cwd="$2" pid="$3"
+  shift 3
+  jq -nc --arg cwd "$cwd" --argjson started "$REIN_ST_STARTED_AT_MS" --argjson pid "$pid" \
+    '[ $ARGS.positional[]
+       | {pid: $pid, cwd: $cwd, kind: "background", startedAt: $started,
+          id: ("job-" + .), sessionId: ., name: "predecessor", state: "working", status: "stopped"} ]' \
     --args "$@" >"$file"
 }
 
